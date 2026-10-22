@@ -1,0 +1,10 @@
+[package]
+name = "present-domain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared presentation domain models"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

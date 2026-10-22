@@ -1,0 +1,16 @@
+# Build context exclusions
+.git
+.gitignore
+.dockerignore
+Dockerfile
+compose.yaml
+
+target
+data
+web/node_modules
+web/dist
+
+**/*.log
+**/.DS_Store
+.env
+.env.*

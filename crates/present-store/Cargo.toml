@@ -1,0 +1,16 @@
+[package]
+name = "present-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Git-backed deck persistence and merge operations"
+
+[dependencies]
+git2 = { version = "0.21", default-features = false }
+mime_guess = "2"
+present-domain = { path = "../present-domain" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }

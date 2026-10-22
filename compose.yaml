@@ -1,0 +1,31 @@
+services:
+  present-api:
+    build:
+      context: .
+      target: api
+    image: present-api:local
+    init: true
+    environment:
+      PRESENT_SEED: "${PRESENT_SEED:-1}"
+      RUST_LOG: "${RUST_LOG:-present_server=info,present_http_api=info,present_store=info}"
+    volumes:
+      - present-data:/data
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  present-web:
+    build:
+      context: .
+      target: web
+    image: present-web:local
+    init: true
+    ports:
+      - "${PRESENT_PORT:-3000}:80"
+    depends_on:
+      present-api:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 10s
+
+volumes:
+  present-data:

@@ -1,0 +1,16 @@
+[package]
+name = "present-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Git-native presentation platform backend"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+present-domain = { path = "../present-domain" }
+present-http-api = { path = "../present-http-api" }
+present-store = { path = "../present-store" }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
