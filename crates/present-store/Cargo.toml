@@ -6,6 +6,7 @@ license.workspace = true
 description = "Git-backed deck persistence and merge operations"
 
 [dependencies]
+base64 = "0.22"
 git2 = { version = "0.21", default-features = false }
 mime_guess = "2"
 present-domain = { path = "../present-domain" }
@@ -14,3 +15,4 @@ serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
+parking_lot = "0.13"

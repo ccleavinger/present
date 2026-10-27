@@ -1,5 +1,4 @@
 use axum::Router;
-use present_domain::CreateDeckRequest;
 use present_store::AppState;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -7,6 +6,7 @@ use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    load_local_env();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -22,8 +22,8 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&decks_root)?;
 
     let state = Arc::new(AppState::new(decks_root));
-    seed_demo_deck(&state)?;
     spawn_session_watchdog(state.clone());
+    spawn_autocommit_worker(state.clone());
 
     let app = Router::new().nest("/api", present_http_api::router(state.clone()));
     let addr = std::env::var("PRESENT_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".into());
@@ -38,20 +38,18 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn seed_demo_deck(state: &AppState) -> anyhow::Result<()> {
-    let seed = std::env::var("PRESENT_SEED")
-        .map(|value| value != "0")
-        .unwrap_or(true);
-    if seed && state.list_decks()?.is_empty() {
-        match state.create_deck(CreateDeckRequest {
-            title: "Welcome to Present".into(),
-            id: Some("welcome".into()),
-        }) {
-            Ok(_) => tracing::info!("seeded demo deck 'welcome'"),
-            Err(err) => tracing::warn!("could not seed demo deck: {err}"),
-        }
+fn load_local_env() {
+    let Ok(contents) = std::fs::read_to_string(".local.env") else { return; };
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        let Some((name, value)) = line.split_once('=') else { continue; };
+        let name = name.trim();
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') { continue; }
+        if std::env::var_os(name).is_some() { continue; }
+        let value = value.trim().trim_matches(|c| c == '\'' || c == '"');
+        std::env::set_var(name, value);
     }
-    Ok(())
 }
 
 fn spawn_session_watchdog(state: Arc<AppState>) {
@@ -64,6 +62,25 @@ fn spawn_session_watchdog(state: Arc<AppState>) {
                 state.expire_sessions(Duration::from_secs(15 * 60));
             })
             .await;
+        }
+    });
+}
+
+fn spawn_autocommit_worker(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            ticker.tick().await;
+            let state = state.clone();
+            match tokio::task::spawn_blocking(move || state.auto_commit_due()).await {
+                Ok(Ok(commits)) => {
+                    for commit in commits {
+                        tracing::info!(commit = %commit.id, summary = %commit.summary, "created semantic auto-save");
+                    }
+                }
+                Ok(Err(err)) => tracing::warn!(error = %err, "semantic auto-save failed"),
+                Err(err) => tracing::warn!(error = %err, "semantic auto-save task failed"),
+            }
         }
     });
 }

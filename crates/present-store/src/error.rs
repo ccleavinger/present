@@ -7,6 +7,10 @@ pub enum AppError {
     #[error("{0}")]
     Conflict(String),
     #[error("{0}")]
+    Unauthorized(String),
+    #[error("{0}")]
+    Forbidden(String),
+    #[error("{0}")]
     Internal(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -21,6 +25,8 @@ pub enum AppErrorKind {
     BadRequest,
     NotFound,
     Conflict,
+    Unauthorized,
+    Forbidden,
     Internal,
 }
 
@@ -30,6 +36,8 @@ impl AppError {
             Self::BadRequest(_) => AppErrorKind::BadRequest,
             Self::NotFound(_) => AppErrorKind::NotFound,
             Self::Conflict(_) => AppErrorKind::Conflict,
+            Self::Unauthorized(_) => AppErrorKind::Unauthorized,
+            Self::Forbidden(_) => AppErrorKind::Forbidden,
             Self::Internal(_) | Self::Io(_) | Self::Json(_) => AppErrorKind::Internal,
             Self::Git(err) => match err.code() {
                 git2::ErrorCode::NotFound | git2::ErrorCode::UnbornBranch => AppErrorKind::NotFound,

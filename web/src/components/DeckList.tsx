@@ -1,9 +1,17 @@
-import { For, Show, createSignal, onMount } from "solid-js";
-import type { DeckSummary } from "../types";
+import { For, Show, createSignal, onMount, onCleanup } from "solid-js";
+import type { DeckSummary, TemplateBundleSummary } from "../types";
 import { api, formatTime } from "../api";
+import { TemplateLibraryModal, runTemplateGenerator } from "./TemplateLibraryModal";
+import type { DemoUser } from "../types";
+import type { Slide } from "../types";
+import { DeckCardPreview } from "./DeckCardPreview";
+import { UserMenu } from "./UserMenu";
+import { ImportPptxModal } from "./ImportPptxModal";
 
 interface DeckListProps {
   onOpen: (id: string) => void;
+  activeDemoUser: DemoUser;
+  onSignOut: () => void;
 }
 
 const PREVIEW_TONES = [
@@ -21,13 +29,24 @@ export function DeckList(props: DeckListProps) {
   const [error, setError] = createSignal<string | null>(null);
   const [creating, setCreating] = createSignal(false);
   const [title, setTitle] = createSignal("");
+  const [templateId, setTemplateId] = createSignal("starter");
   const [showForm, setShowForm] = createSignal(false);
+  const [bundles, setBundles] = createSignal<TemplateBundleSummary[]>([]);
+  const [templatesOpen, setTemplatesOpen] = createSignal(false);
+  const [importOpen, setImportOpen] = createSignal(false);
+  const [previews, setPreviews] = createSignal<Record<string, Slide>>({});
 
-  const refresh = async () => {
-    setLoading(true);
+  const refresh = async (background = false) => {
+    if (!background) setLoading(true);
     setError(null);
     try {
-      setDecks(await api.listDecks());
+      const nextDecks = await api.listDecks();
+      setDecks(nextDecks);
+      const loaded = await Promise.all(nextDecks.filter((deck) => deck.firstSlideId).map(async (deck) => {
+        try { return [deck.id, (await api.getSlide(deck.id, deck.firstSlideId!, undefined, deck.currentBranch)).slide] as const; }
+        catch { return null; }
+      }));
+      setPreviews(Object.fromEntries(loaded.filter((item): item is NonNullable<typeof item> => item !== null)));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -35,7 +54,42 @@ export function DeckList(props: DeckListProps) {
     }
   };
 
-  onMount(refresh);
+  onMount(() => {
+    let disposed = false;
+    let socket: WebSocket | undefined;
+    let retryTimer: number | undefined;
+    let refreshTimer: number | undefined;
+    let refreshing = false;
+    let again = false;
+    const update = async () => {
+      if (disposed) return;
+      if (refreshing) { again = true; return; }
+      refreshing = true;
+      try { await refresh(true); } finally {
+        refreshing = false;
+        if (again) { again = false; schedule(); }
+      }
+    };
+    const schedule = () => {
+      if (!disposed && !refreshTimer) refreshTimer = window.setTimeout(() => { refreshTimer = undefined; void update(); }, 350);
+    };
+    const connect = () => {
+      if (disposed) return;
+      socket = api.connectLibrary(schedule);
+      socket.addEventListener("close", () => { if (!disposed) retryTimer = window.setTimeout(connect, 1500); });
+    };
+    connect();
+    window.addEventListener("online", schedule);
+    window.addEventListener("focus", schedule);
+    onCleanup(() => {
+      disposed = true; socket?.close();
+      if (retryTimer) window.clearTimeout(retryTimer);
+      if (refreshTimer) window.clearTimeout(refreshTimer);
+      window.removeEventListener("online", schedule); window.removeEventListener("focus", schedule);
+    });
+  });
+
+  onMount(() => { void refresh(); void api.templateBundles().then(setBundles).catch((err) => setError(String(err))); });
 
   const create = async (event: SubmitEvent) => {
     event.preventDefault();
@@ -44,7 +98,13 @@ export function DeckList(props: DeckListProps) {
     setCreating(true);
     setError(null);
     try {
-      const deck = await api.createDeck(value);
+      const bundle = bundles().find((item) => item.id === templateId());
+      let readyBundle = bundle?.kind === "code" ? await api.getTemplateBundle(bundle.id) : undefined;
+      if (readyBundle?.generator) {
+        const generated = await runTemplateGenerator(readyBundle.generator, readyBundle.customObjectTypes);
+        readyBundle = { ...readyBundle, ...generated };
+      }
+      const deck = await api.createDeck(value, undefined, bundle ? bundle.id : templateId(), readyBundle);
       setTitle("");
       setShowForm(false);
       props.onOpen(deck.id);
@@ -77,58 +137,15 @@ export function DeckList(props: DeckListProps) {
             <p class="text-xs font-medium text-cocoa-500">Git-native presentations</p>
           </div>
         </div>
-        <button class="btn accent" onClick={() => setShowForm((v) => !v)}>
-          + New deck
-        </button>
+        <div class="home-header-actions">
+          <button class="btn ghost small" onClick={() => setTemplatesOpen(true)}>Templates</button>
+          <UserMenu user={props.activeDemoUser} onSignOut={props.onSignOut} />
+        </div>
       </header>
 
-      <section class="home-hero relative grid gap-8 overflow-hidden rounded-4xl border border-cream-300 bg-cream-50 p-6 md:p-10 lg:grid-cols-[1.15fr_0.85fr] lg:items-center">
-        <div class="relative">
-          <p class="mb-3 inline-flex items-center gap-2 rounded-full border border-coral-300 bg-coral-200/60 px-3 py-1 text-[11px] font-bold uppercase tracking-[0.14em] text-cocoa-700">
-            <span class="h-1.5 w-1.5 rounded-full bg-coral-600" />
-            Local-first · branchable · mergeable
-          </p>
-          <h2 class="max-w-[18ch] text-balance text-3xl font-extrabold leading-[1.08] tracking-[-0.03em] text-cocoa-900 md:text-5xl">
-            Collaborative slides so painless its a gift; Present.
-          </h2>
-          <p class="mt-5 max-w-[58ch] text-sm leading-7 text-cocoa-600 md:text-[15px]">
-            Every deck is a Git repo. Each slide is an isolated folder with a canonical JSON AST,
-            co-located assets, and Markdown notes. Sessions become commits, and merges are resolved
-            visually instead of with line markers.
-          </p>
-          <div class="mt-6 flex flex-wrap gap-2">
-            <span class="rounded-full border border-coral-300 bg-coral-200/60 px-3 py-1.5 text-xs font-semibold text-cocoa-700">
-              Flat sorted AST
-            </span>
-            <span class="rounded-full border border-lavender-300 bg-lavender-200/70 px-3 py-1.5 text-xs font-semibold text-cocoa-700">
-              Session commits
-            </span>
-            <span class="rounded-full border border-mint-300 bg-mint-200/75 px-3 py-1.5 text-xs font-semibold text-cocoa-700">
-              3-way semantic merge
-            </span>
-            <span class="rounded-full border border-butter-300 bg-butter-200/80 px-3 py-1.5 text-xs font-semibold text-cocoa-700">
-              Sandboxed scripting
-            </span>
-          </div>
-        </div>
-        <div
-          class="relative overflow-hidden rounded-2xl border border-tan-300 bg-cream-100 p-5 font-mono text-[11.5px] leading-7 text-cocoa-700"
-          aria-hidden="true"
-        >
-          <div class="mb-3 flex items-center gap-1.5">
-            <span class="h-2.5 w-2.5 rounded-full bg-coral-400" />
-            <span class="h-2.5 w-2.5 rounded-full bg-butter-300" />
-            <span class="h-2.5 w-2.5 rounded-full bg-mint-300" />
-            <span class="ml-auto text-[10px] text-cocoa-500">deck-repo</span>
-          </div>
-          <div class="text-cocoa-600">deck-repo/</div>
-          <div>├── deck.json</div>
-          <div>└── slides/</div>
-          <div class="pl-6 text-coral-600">├── s_01_title/</div>
-          <div class="pl-12 text-cocoa-600">├── slide.json</div>
-          <div class="pl-12 text-sage-400">└── notes.md</div>
-          <div class="pl-6 text-berry-400">└── s_02_repository/</div>
-        </div>
+      <section class="deck-create-launcher" aria-label="Create a presentation">
+        <div><span class="create-launcher-icon">✦</span><div><h2>Start with a blank page or a spark</h2><p>Choose a template or bring your PowerPoint slides.</p></div></div>
+        <div class="create-launcher-actions"><button class="btn" onClick={() => setImportOpen(true)}>Import PowerPoint</button><button class="btn accent create-launcher-button" onClick={() => setShowForm((value) => !value)}>{showForm() ? "Close" : "+ Create a presentation"}</button></div>
       </section>
 
       <Show when={showForm()}>
@@ -146,11 +163,22 @@ export function DeckList(props: DeckListProps) {
               onInput={(event) => setTitle(event.currentTarget.value)}
             />
           </label>
+          <label class="field">
+            <span>Starting point</span>
+            <select value={templateId()} onChange={(event) => setTemplateId(event.currentTarget.value)}>
+              <option value="starter">Present starter deck</option>
+              <option value="blank">Blank slide</option>
+              <For each={bundles()}>{(bundle) => <option value={bundle.id}>{bundle.name} template</option>}</For>
+            </select>
+          </label>
           <button class="btn accent" type="submit" disabled={creating()}>
             {creating() ? "Creating repository…" : "Create deck"}
           </button>
         </form>
       </Show>
+
+      <Show when={templatesOpen()}><TemplateLibraryModal onClose={() => { setTemplatesOpen(false); void api.templateBundles().then(setBundles); }} /></Show>
+      <Show when={importOpen()}><ImportPptxModal onClose={() => setImportOpen(false)} onCreated={(id) => { setImportOpen(false); props.onOpen(id); }} /></Show>
 
       <Show when={error()}>
         <div class="alert error">{error()}</div>
@@ -159,7 +187,7 @@ export function DeckList(props: DeckListProps) {
       <section class="decks-section flex flex-col gap-4">
         <div class="section-head flex items-center justify-between gap-4">
           <h3 class="text-lg font-extrabold tracking-tight text-cocoa-900">Your decks</h3>
-          <button class="link" onClick={refresh}>
+          <button class="link" onClick={() => void refresh()}>
             Refresh
           </button>
         </div>
@@ -191,19 +219,22 @@ export function DeckList(props: DeckListProps) {
             <div class="deck-grid grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
               <For each={decks()}>
                 {(deck, index) => (
-                  <article
-                    class="deck-card group cursor-pointer overflow-hidden rounded-2xl border border-cream-300 bg-cream-50 transition-colors hover:border-tan-400"
-                    onClick={() => props.onOpen(deck.id)}
-                  >
+                  <article class="deck-card group relative overflow-hidden rounded-2xl border border-cream-300 bg-cream-50 transition-colors hover:border-tan-400">
+                    <a
+                      class="deck-card-link block"
+                      href={`#/deck/${encodeURIComponent(deck.id)}`}
+                      aria-label={`Open ${deck.title}`}
+                      onClick={() => props.onOpen(deck.id)}
+                    >
                     <div
                       class={`deck-preview relative flex aspect-[16/8] items-end p-3 ${
                         PREVIEW_TONES[index() % PREVIEW_TONES.length]
                       }`}
                     >
+                      <Show when={previews()[deck.id]} fallback={<span class="deck-monogram grid h-14 w-14 place-items-center rounded-2xl border border-white/70 bg-cream-50 text-2xl font-extrabold text-cocoa-900">{deck.title.slice(0, 1).toUpperCase()}</span>}>
+                        {(preview) => <DeckCardPreview slide={preview()} />}
+                      </Show>
                       <div class="deck-preview-inner relative flex w-full items-end justify-between gap-2">
-                        <span class="deck-monogram grid h-14 w-14 place-items-center rounded-2xl border border-white/70 bg-cream-50 text-2xl font-extrabold text-cocoa-900">
-                          {deck.title.slice(0, 1).toUpperCase()}
-                        </span>
                         <span class="deck-slide-count rounded-full border border-white/70 bg-cream-50 px-2.5 py-1 text-[10px] font-bold text-cocoa-700">
                           {deck.slideCount} slides
                         </span>
@@ -223,18 +254,22 @@ export function DeckList(props: DeckListProps) {
                           </Show>
                           <span class="pl-0.5">{formatTime(deck.updatedAt)}</span>
                         </div>
+                        <div class="deck-card-footer">
+                          <span class={`permission-chip role-${deck.currentUserRole ?? "view"}`}>{deck.isOwner ? "Owner" : `${deck.currentUserRole ?? "view"} access`}</span>
+                          <div class="collaborator-stack" aria-label={`${deck.collaborators?.length ?? 0} collaborators`}>
+                            <For each={(deck.collaborators ?? []).slice(0, 3)}>{(collaborator) => <span class="user-avatar tiny" title={collaborator.username}>{collaborator.username.slice(0, 1).toUpperCase()}</span>}</For>
+                            <Show when={(deck.collaborators?.length ?? 0) > 3}><span class="avatar-overflow">+{(deck.collaborators?.length ?? 0) - 3}</span></Show>
+                          </div>
+                        </div>
                       </div>
-                      <button
-                        class="icon-btn danger shrink-0 opacity-0 transition group-hover:opacity-100"
-                        title="Delete deck"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          remove(deck);
-                        }}
-                      >
-                        ✕
-                      </button>
                     </div>
+                    </a>
+                    <Show when={deck.isOwner}><button
+                      class="deck-card-delete icon-btn danger absolute right-3 top-3 z-10 opacity-0 transition group-hover:opacity-100 focus:opacity-100"
+                      title="Delete deck"
+                      aria-label={`Delete ${deck.title}`}
+                      onClick={() => remove(deck)}
+                    >✕</button></Show>
                   </article>
                 )}
               </For>

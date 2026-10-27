@@ -40,7 +40,7 @@ export function createTextElement(x: number, y: number, text = "New text"): Slid
 }
 
 export function createShapeElement(
-  kind: "rect" | "ellipse",
+  kind: "rect" | "ellipse" | "triangle" | "diamond" | "star" | "arrow" | "callout",
   x: number,
   y: number,
 ): SlideElement {
@@ -55,21 +55,42 @@ export function createShapeElement(
     z: 0,
     fill: "#ffb9a5",
     style: {},
+    shapeParams: kind === "rect" ? { cornerRadius: 0 }
+      : kind === "star" ? { points: 5, innerRadius: 22 }
+        : kind === "arrow" ? { shaftWidth: 28, headLength: 32, headWidth: 60 }
+          : kind === "callout" ? { tailPosition: 25, tailWidth: 24, tailLength: 18 }
+            : {},
   };
 }
 
-export function createImageElement(url: string, x: number, y: number): SlideElement {
+export function createImageElement(
+  url: string,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+): SlideElement {
   return {
     id: newElementId(),
     type: "image",
     x,
     y,
-    w: 640,
-    h: 400,
+    w: width,
+    h: height,
     rotation: 0,
     z: 0,
     src: url,
-    style: {},
+    style: { fit: "contain" },
+  };
+}
+
+export function createQrCodeElement(x: number, y: number): SlideElement {
+  return {
+    id: newElementId("qr"),
+    type: "custom",
+    customType: "qr-code",
+    customProps: { text: "https://example.com", color: "#000000" },
+    x, y, w: 320, h: 320, rotation: 0, z: 0, style: {}, renderData: [],
   };
 }
 
@@ -128,10 +149,16 @@ export function textCss(el: SlideElement, scale = 1): JSX.CSSProperties {
     "text-decoration": styleString(el.style, "textDecoration", "none"),
     "white-space": "pre-wrap",
     "word-break": "break-word",
+    "overflow-wrap": "anywhere",
     width: "100%",
-    height: "100%",
-    overflow: "hidden",
   };
+}
+
+export function measureTextHeight(node: HTMLElement): number {
+  const style = window.getComputedStyle(node);
+  const fontSize = Number.parseFloat(style.fontSize) || 48;
+  const lineHeight = Number.parseFloat(style.lineHeight) || fontSize * 1.2;
+  return Math.ceil(Math.max(node.scrollHeight, lineHeight));
 }
 
 export function isEditableTarget(target: EventTarget | null): boolean {

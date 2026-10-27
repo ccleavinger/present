@@ -1,4 +1,4 @@
-import { For, Show, createSignal, onMount } from "solid-js";
+import { For, Show, createEffect, createSignal, onCleanup, onMount } from "solid-js";
 import type {
   BranchInfo,
   DeckMerge,
@@ -10,15 +10,15 @@ import type {
   SlideMerge,
 } from "../types";
 import { api } from "../api";
-import { Modal } from "./Modal";
 import { StaticSlide } from "./ElementView";
 
-interface MergeModalProps {
+interface MergePanelProps {
   deckId: string;
   currentBranch: string;
+  sessionId?: string;
   branches: BranchInfo[];
-  onClose: () => void;
-  onMerged: (summary: string) => void;
+  onMerged: (summary: string) => Promise<void>;
+  onBusyChange: (busy: boolean) => void;
 }
 
 const MINI_WIDTH = 400;
@@ -28,7 +28,7 @@ function conflictKey(conflict: MergeConflict): string {
   return `${conflict.scope}\u0000${conflict.path}`;
 }
 
-export function MergeModal(props: MergeModalProps) {
+export function MergePanel(props: MergePanelProps) {
   const others = () => props.branches.filter((b) => b.name !== props.currentBranch);
   const [source, setSource] = createSignal(others()[0]?.name ?? "");
   const [preview, setPreview] = createSignal<MergePreview | null>(null);
@@ -71,6 +71,8 @@ export function MergeModal(props: MergeModalProps) {
   };
 
   onMount(load);
+  createEffect(() => props.onBusyChange(applying()));
+  onCleanup(() => { requestSeq += 1; props.onBusyChange(false); });
 
   const choiceFor = (conflict: MergeConflict) => choices()[conflictKey(conflict)] ?? "ours";
   const setChoice = (conflict: MergeConflict, choice: "ours" | "theirs") => {
@@ -88,67 +90,27 @@ export function MergeModal(props: MergeModalProps) {
         path: conflict.path,
         choice: choiceFor(conflict),
       }));
-      const commit = await api.applyMerge(props.deckId, current.source, resolutions);
-      props.onMerged(commit.summary);
+      const commit = await api.applyMerge(props.deckId, current.source, resolutions, undefined, props.sessionId);
+      await props.onMerged(commit.summary);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
-      setApplying(false);
-    }
+    } finally { setApplying(false); }
   };
 
   const slideMerge = () => preview()?.slides.find((s) => s.slideId === selectedSlide());
   const notesMerge = () => preview()?.notes.find((n) => n.slideId === selectedSlide());
 
   return (
-    <Modal
-      title="Merge branches"
-      subtitle={`3-way semantic AST merge · ${props.currentBranch} ← ${source() || "branch"}`}
-      wide
-      onClose={props.onClose}
-      footer={
-        <>
-          <span class="muted small">
-            <Show when={preview()} fallback="Pick a source branch to preview the merge.">
-              {(value) => (
-                <>
-                  {value().conflictCount} conflict{value().conflictCount === 1 ? "" : "s"} ·{" "}
-                  {value().changedCount} changed file{value().changedCount === 1 ? "" : "s"}
-                </>
-              )}
-            </Show>
-          </span>
-          <div class="row-gap">
-            <button class="btn ghost" onClick={props.onClose}>
-              Cancel
-            </button>
-            <button
-              class="btn accent"
-              disabled={
-                !preview() ||
-                applying() ||
-                preview()!.changedCount === 0 ||
-                preview()!.source === preview()!.target
-              }
-              onClick={apply}
-            >
-              {applying()
-                ? "Merging…"
-                : preview()?.conflictCount
-                  ? "Resolve & merge"
-                  : "Merge cleanly"}
-            </button>
-          </div>
-        </>
-      }
-    >
+    <section class="timeline-merge">
+      <p class="muted small">Bring another branch’s changes into <strong>{props.currentBranch}</strong>. Preview the result and resolve any conflicts before merging.</p>
       <div class="merge-source-bar">
         <label class="field inline">
           <span>Source branch</span>
-          <select value={source()} onChange={(event) => changeSource(event.currentTarget.value)}>
+          <select aria-label="Merge source branch" value={source()} disabled={applying()} onChange={(event) => changeSource(event.currentTarget.value)}>
             <For each={others()}>{(branch) => <option value={branch.name}>{branch.name}</option>}</For>
           </select>
         </label>
-        <button class="btn ghost" onClick={load} disabled={loading() || !source()}>
+        <button class="btn ghost" onClick={load} disabled={loading() || applying() || !source()}>
           {loading() ? "Computing…" : "Preview merge"}
         </button>
         <Show when={preview()}>
@@ -268,7 +230,10 @@ export function MergeModal(props: MergeModalProps) {
       <Show when={!preview() && !loading() && !error()}>
         <div class="merge-empty">Choose a branch and preview the semantic merge.</div>
       </Show>
-    </Modal>
+      <div class="timeline-merge-actions"><span class="muted small"><Show when={preview()} fallback="Choose a source branch to preview the merge.">{(value) => <>{value().conflictCount} conflicts · {value().changedCount} changed files</>}</Show></span>
+        <button class="btn accent" disabled={!preview() || loading() || applying() || preview()!.changedCount === 0 || preview()!.source === preview()!.target} onClick={apply}>{applying() ? "Merging…" : preview()?.conflictCount ? "Resolve & merge" : "Merge cleanly"}</button>
+      </div>
+    </section>
   );
 }
 
@@ -325,7 +290,7 @@ function ConflictCard(props: {
     if (props.conflict.path === "__notes__") return "Notes document";
     const parts = props.conflict.path.split("/");
     if (parts[0] === "elements" && parts.length >= 3) {
-      return `${parts[1]} · ${parts.slice(2).join(".")}`;
+      return `Element properties · ${parts.slice(2).join(".")}`;
     }
     return props.conflict.path;
   };
@@ -333,9 +298,6 @@ function ConflictCard(props: {
     <div class="conflict-card">
       <div class="conflict-path">
         {label()}
-        <Show when={props.conflict.elementId}>
-          <span class="element-chip">{props.conflict.elementId}</span>
-        </Show>
       </div>
       <div class="conflict-choices">
         <label classList={{ chosen: props.choice === "ours" }}>

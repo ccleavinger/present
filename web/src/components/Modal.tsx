@@ -5,6 +5,8 @@ interface ModalProps {
   title: string;
   subtitle?: string;
   wide?: boolean;
+  class?: string;
+  bodyClass?: string;
   onClose: () => void;
   children: JSX.Element;
   footer?: JSX.Element;
@@ -21,7 +23,7 @@ export function Modal(props: ModalProps) {
       <div
         class={`modal my-auto flex max-h-[90vh] w-full flex-col overflow-hidden rounded-3xl border border-cream-300 bg-cream-50 shadow-[0_8px_24px_-16px_rgba(55,38,29,0.22)] ${
           props.wide ? "wide max-w-5xl" : "max-w-xl"
-        }`}
+        } ${props.class ?? ""}`}
         role="dialog"
         aria-modal="true"
       >
@@ -36,7 +38,7 @@ export function Modal(props: ModalProps) {
             ✕
           </button>
         </header>
-        <div class="modal-body min-h-0 overflow-y-auto px-5 py-5">{props.children}</div>
+        <div class={`modal-body min-h-0 overflow-y-auto px-5 py-5 ${props.bodyClass ?? ""}`}>{props.children}</div>
         <Show when={props.footer}>
           <footer class="modal-foot flex items-center justify-between gap-4 border-t border-cream-300 bg-cream-100/80 px-5 py-3">
             {props.footer}

@@ -6,8 +6,10 @@ services:
     image: present-api:local
     init: true
     environment:
-      PRESENT_SEED: "${PRESENT_SEED:-1}"
       RUST_LOG: "${RUST_LOG:-present_server=info,present_http_api=info,present_store=info}"
+    env_file:
+      - path: .local.env
+        required: false
     volumes:
       - present-data:/data
     restart: unless-stopped

@@ -19,6 +19,8 @@ impl IntoResponse for ApiError {
             AppErrorKind::BadRequest => StatusCode::BAD_REQUEST,
             AppErrorKind::NotFound => StatusCode::NOT_FOUND,
             AppErrorKind::Conflict => StatusCode::CONFLICT,
+            AppErrorKind::Unauthorized => StatusCode::UNAUTHORIZED,
+            AppErrorKind::Forbidden => StatusCode::FORBIDDEN,
             AppErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let message = self.0.to_string();

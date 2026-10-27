@@ -14,6 +14,8 @@ checkpoints. Branches merge with a 3-way semantic JSON merge instead of line mar
   - Deck repositories initialized with a pastel starter deck
   - Atomic file writes and recursively sorted canonical JSON
   - Sessions with a 15-minute inactivity watchdog and commit-on-close
+  - Browser-persisted username demo identities, deck ownership, and branch-level roles
+  - Object comments, live presence, remote cursors, and exclusive server-enforced edit locks
   - Branches, checkouts, commit history, manual checkpoints
   - Slide CRUD, ordering, notes, asset upload/serving
   - 3-way AST merge with property-level conflicts and resolution application
@@ -28,12 +30,16 @@ checkpoints. Branches merge with a 3-way semantic JSON merge instead of line mar
   - Fixed 1920×1080 letterboxed stage with `ResizeObserver` auto-fit
   - Drag, resize, rotate, text editing, layer ordering, duplicate/delete
   - Undo/redo, keyboard nudging, full-screen present mode
+  - Scrollable version timeline with slide, image, and notes previews; restore any saved version while preserving current work in history
   - Virtualized-style thumbnail rail with live scaled slide previews and drag reordering
-  - Inspector for position, typography, colors, opacity
+  - Inspector for position, typography, colors, opacity, and visible left/center/right text alignment
   - Markdown speaker-notes drawer
-  - Branch switching/creation, commit history, checkpoint button
+  - One Timeline workspace for branch switching, creation/deletion, version history, checkpoints, and merging
   - Visual merge inspector with side-by-side branch previews and per-property keep-mine/take-theirs
   - Sandboxed user-script runner with mutation patch API and watchdog termination
+  - One Build workspace for agent drafts, scripting, and API reference, with drafts preserved between tabs
+  - Signup/sign-in landing page without an in-app account switcher
+  - First-slide deck previews, collaborator avatars, role labels, username invites, and revocable sharing links
 - **Sandboxing**
   - User scripts run only in a dedicated Web Worker
   - Worker asset served with `default-src 'none'; connect-src 'none'`
@@ -47,6 +53,42 @@ checkpoints. Branches merge with a 3-way semantic JSON merge instead of line mar
 
 The web theme styles the application chrome. Slide backgrounds and element colors are stored
 in each deck’s JSON, so changing the web theme does not recolor existing slides.
+
+Demo accounts are stored in `data/users.json` and deck ownership, collaborators, and comment
+threads are stored under `data/collaboration/`. Sign-in uses a username without a password and the
+browser remembers the selected account. The server enforces deck roles for the supplied account,
+but a caller can impersonate usernames because this demo has no secure authentication. Use only on
+a local or trusted network. Only the presentation creator can delete it; collaborators receive
+view, comment, or edit access on explicitly assigned branches.
+
+Use **Share** to create a link for a chosen branch with view, comment, or edit access. Recipients
+sign in or create an account, then open the presentation on the invited branch; owners do not
+need to add their usernames first. Owners can revoke links from the same dialog. Revocation
+removes access granted by that link while preserving direct invitations and other active links.
+The public invitation preview exposes the deck title, owner, branch, and role, without slide
+contents. Link tokens and grants live outside Git history, so restoring a version cannot undo
+revocation. Text alignment is available in the inspector and through Ctrl/Cmd+Shift+L, E, or R.
+
+Collaboration uses Rust WebSockets without an external realtime service. Each editor keeps one
+connection per editing session and branch. Object leases belong to sessions, so two tabs under the
+same account cannot silently edit the same object. Remote pointers and username badges keep their
+screen size as the canvas zooms, and participant markers follow collaborators between slides.
+
+Drag and text previews are transient messages, coalesced to at most 20 updates per second. The
+server accepts object previews only from the session holding the object's lease. Durable edits
+still use the autosave HTTP endpoints: each write carries its previous slide so the server can
+merge changes to different objects and reject overlapping stale edits without discarding the
+local draft. Speaker notes use the same stale-write protection.
+
+Successful writes notify other editors to refresh slides, notes, slide order, deck metadata,
+comments, access settings, and history. A separate authenticated WebSocket refreshes deck libraries.
+Reconnects and missed-event notifications trigger a fresh read and rebase pending local edits;
+these reads do not become new edits or undo entries. Presence and previews live in server memory,
+while saved files and Git history remain on disk. This provides object-level collaboration;
+simultaneous character edits within one text object are governed by its exclusive lease.
+
+Older demo decks do not have ownership metadata and are not migrated; recreate those decks under
+the new account flow (or clear the Compose volume with the command below).
 
 ## Quick start
 
@@ -62,8 +104,8 @@ bun install
 bun run dev
 ```
 
-Open <http://127.0.0.1:5173>. Vite proxies API requests to Rust on port 3000. A demo deck
-named **Welcome to Present** is seeded on first run.
+Open <http://127.0.0.1:5173>. Vite proxies API requests to Rust on port 3000. Sign up with a
+username, then create your first presentation from the home page.
 
 ### Docker
 
@@ -90,8 +132,8 @@ For a short Compose workflow, run the helper from the repository root (or use it
 ```
 
 The web container listens on port 80 and publishes it at `PRESENT_PORT` (default `3000`). The
-API seeds the demo deck (`PRESENT_SEED=1`) and has a health check against `/api/health`. To use a
-host directory for deck data, replace `present-data:/data` in `compose.yaml` with `./data:/data`
+API has a health check against `/api/health`. To use a host directory for deck data, replace
+`present-data:/data` in `compose.yaml` with `./data:/data`
 and make the host directory writable by UID/GID `10001`.
 
 Compose uses `PRESENT_PORT` (default `3000`) for the published host port.
@@ -115,10 +157,26 @@ Vite runs on <http://127.0.0.1:5173> and proxies `/api` to port 3000.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `PRESENT_DATA_DIR` | `./data` | Root for deck repositories (`data/decks/<id>`) |
+| `PRESENT_DATA_DIR` | `./data` | Root for deck repositories and `users.json` |
 | `PRESENT_ADDR` | `127.0.0.1:3000` | Listen address |
-| `PRESENT_SEED` | `1` | Set to `0` to skip demo-deck seeding |
 | `RUST_LOG` | `present_server=info,present_http_api=info,present_store=info` | Tracing filter |
+| `OPENAI_URL` | Required for the agent | OpenAI-compatible provider base URL (including `/v1` when required), or full `/chat/completions` endpoint |
+| `OPENAI_MODEL` | Required for the agent | Model name sent to the configured provider |
+| `OPENAI_KEY` | Required for the agent | Provider API key; `OPENAI_API_KEY` is also accepted |
+
+The API loads `.local.env` from the repository root during local development. Existing process
+environment variables take precedence. Compose passes `.local.env` to the API container.
+For example:
+
+```dotenv
+OPENAI_URL=https://your-provider.example/v1
+OPENAI_MODEL=your-provider-model
+OPENAI_KEY=your-api-key
+```
+
+The agent uses the provider's OpenAI-compatible Chat Completions interface. It appends
+`/chat/completions` to a base URL, or uses a full Chat Completions URL directly, preserving
+query parameters. The API key stays on the backend. Restart the API after changing these settings.
 
 ## Repository format
 
@@ -150,6 +208,9 @@ scale = min((containerW - 2*pad) / 1920, (containerH - 2*pad) / 1080)
 
 | Method | Path | Description |
 | --- | --- | --- |
+| `GET` | `/api/users` | List demo usernames |
+| `POST` | `/api/users` | Create a username account |
+| `POST` | `/api/users/sign-in` | Sign into an existing username account |
 | `GET` | `/api/decks` | List decks |
 | `POST` | `/api/decks` | Create a deck repository |
 | `GET` | `/api/decks/{deck}` | Deck manifest, slide summaries, branches |
@@ -172,8 +233,27 @@ scale = min((containerW - 2*pad) / 1920, (containerH - 2*pad) / 1080)
 | `POST` | `/api/decks/{deck}/merge/apply` | Apply merge with resolutions |
 | `POST` | `/api/decks/{deck}/slides/{slide}/assets` | Multipart asset upload |
 | `GET` | `/api/decks/{deck}/slides/{slide}/assets/{name}` | Asset bytes |
+| `GET/POST` | `/api/decks/{deck}/collaboration` and `/members` | Read access and invite a user by username |
+| `GET/POST` | `/api/decks/{deck}/collaboration/links` | Owner-only sharing link list/creation |
+| `DELETE` | `/api/decks/{deck}/collaboration/links/{link}` | Revoke a sharing link and its access grants |
+| `GET` | `/api/share/{deck}/{token}` | Public invitation metadata preview |
+| `POST` | `/api/share/{deck}/{token}/join` | Join the invited branch using the signed-in account |
+| `GET/POST` | `/api/decks/{deck}/comments` | Read or add object-anchored comments and replies |
+| `PUT/DELETE` | `/api/decks/{deck}/comments/{comment}` | Edit/delete a comment you authored |
+| `POST` | `/api/decks/{deck}/locks` | Acquire or release object edit locks |
+| `WS` | `/api/decks/{deck}/presence` | Rust-managed active-slide and cursor state, with lock snapshots |
 
 Image uploads allow files up to 100 MiB.
+
+Deck API routes require the selected profile ID in `X-Present-User`; image URLs carry their branch
+and demo profile because `<img>` requests cannot set custom headers. Role checks run in the server.
+The username-only demo identity is still spoofable and must not be treated as production security.
+Object locks expire after 15 seconds without a refresh and are also released when the editor
+connection closes.
+
+To clear all Docker data, run `docker compose down -v` from the repository root. This removes the
+`present-data` volume, including presentations and profiles. `./present.sh down` stops the
+containers but keeps that volume.
 
 ## Semantic merge
 
@@ -223,5 +303,5 @@ This is intentionally a basic implementation. Notable simplifications:
 - Merge conflicts are resolved per property with keep-mine/take-theirs; there is no freeform
   merged-value editor.
 - Resize math is exact for unrotated elements and approximate for rotated elements.
-- No multi-select, grouping, comments, presence, or server-side auth.
+- Sign-in is a username-only demo flow, not production authentication.
 - A merge targets the currently checked-out branch.

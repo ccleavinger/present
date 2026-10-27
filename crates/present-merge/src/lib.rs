@@ -2,17 +2,13 @@ use git2::{BranchType, Oid, Repository, Tree};
 use present_domain::*;
 use present_store::error::{AppError, AppResult};
 use present_store::jsonutil::{write_atomic, write_json_atomic};
-use present_store::store::{commit_all, current_branch, merge_commit, workdir, AppState};
+use present_store::store::{commit_all_as, current_branch, merge_commit_as, workdir, AppState};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Choice {
-    Ours,
-    Theirs,
-}
+type Choice = ResolutionChoice;
 
 type Choices = HashMap<(String, String), Choice>;
 
@@ -139,15 +135,15 @@ fn status_for(
     base: &Option<Value>,
     ours: &Option<Value>,
     conflicts: bool,
-) -> String {
+) -> MergeStatus {
     if conflicts {
-        "conflict".into()
+        MergeStatus::Conflict
     } else if merged == base {
-        "unchanged".into()
+        MergeStatus::Unchanged
     } else if merged == ours {
-        "modified".into()
+        MergeStatus::Modified
     } else {
-        "merged".into()
+        MergeStatus::Merged
     }
 }
 
@@ -337,7 +333,11 @@ fn merge_snapshots(
     let mut slides = Vec::new();
     let mut notes_out = Vec::new();
     let mut conflict_count = deck_ctx.conflicts.len();
-    let mut changed_count = if deck_status == "unchanged" { 0 } else { 1 };
+    let mut changed_count = if deck_status == MergeStatus::Unchanged {
+        0
+    } else {
+        1
+    };
 
     for slide_id in slide_ids {
         let scope = format!("slide:{slide_id}");
@@ -368,7 +368,7 @@ fn merge_snapshots(
             &ours_v,
             !ctx.conflicts.is_empty(),
         );
-        if status != "unchanged" {
+        if status != MergeStatus::Unchanged {
             changed_count += 1;
         }
         slides.push(SlideMerge {
@@ -417,19 +417,19 @@ fn merge_snapshots(
             }
         };
         let status = if !ctx.conflicts.is_empty() {
-            "conflict"
+            MergeStatus::Conflict
         } else if merged_note == base_note {
-            "unchanged"
+            MergeStatus::Unchanged
         } else {
-            "modified"
+            MergeStatus::Modified
         };
         conflict_count += ctx.conflicts.len();
-        if status != "unchanged" {
+        if status != MergeStatus::Unchanged {
             changed_count += 1;
         }
         notes_out.push(NotesMerge {
             slide_id,
-            status: status.into(),
+            status,
             merged: merged_note.unwrap_or_default(),
             ours: ours_note.unwrap_or_default(),
             theirs: theirs_note.unwrap_or_default(),
@@ -460,27 +460,33 @@ fn merge_snapshots(
     })
 }
 
-pub fn apply(state: &AppState, deck_id: &str, req: ApplyMergeRequest) -> AppResult<CommitInfo> {
-    let repo = state.open_repo(deck_id)?;
+pub fn apply(
+    state: &AppState,
+    deck_id: &str,
+    req: ApplyMergeRequest,
+    actor: &DemoUser,
+) -> AppResult<CommitInfo> {
+    state.validate_session_actor(deck_id, req.session_id.as_deref(), actor)?;
+    let repo = match req.session_id.as_deref() {
+        Some(session) => state.repo_for_session(session)?,
+        None => state.open_repo(deck_id)?,
+    };
     let target = current_branch(&repo)?;
+    state.require_deck_role(deck_id, actor, &req.source, present_domain::DeckRole::View)?;
+    state.require_deck_role(deck_id, actor, &target, present_domain::DeckRole::Edit)?;
     if req.source == target {
         return Err(AppError::BadRequest(
             "source and target branches must differ".into(),
         ));
     }
     // Never merge over uncommitted work: fold it into a checkpoint first.
-    commit_all(&repo, "Checkpoint before merge", &[])?;
+    commit_all_as(&repo, "Checkpoint before merge", &[], actor)?;
 
     let mut choices = Choices::new();
     for resolution in &req.resolutions {
-        let choice = match resolution.choice.as_str() {
-            "ours" => Choice::Ours,
-            "theirs" => Choice::Theirs,
-            other => {
-                return Err(AppError::BadRequest(format!(
-                    "invalid resolution choice '{other}'"
-                )))
-            }
+        let choice = match resolution.choice {
+            ResolutionChoice::Ours => Choice::Ours,
+            ResolutionChoice::Theirs => Choice::Theirs,
         };
         choices.insert((resolution.scope.clone(), resolution.path.clone()), choice);
     }
@@ -492,7 +498,7 @@ pub fn apply(state: &AppState, deck_id: &str, req: ApplyMergeRequest) -> AppResu
     let message = req
         .message
         .unwrap_or_else(|| format!("Merge branch '{}' into {}", req.source, target));
-    merge_commit(&repo, &message, ours_oid, theirs_oid)
+    merge_commit_as(&repo, &message, ours_oid, theirs_oid, actor)
 }
 
 fn write_merged_snapshot(repo: &Repository, merged: &MergePreview, theirs: Oid) -> AppResult<()> {
