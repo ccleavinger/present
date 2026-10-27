@@ -1,10 +1,11 @@
-import { Show, createEffect, createSignal, onCleanup, onMount } from "solid-js";
+import { Show, Suspense, createEffect, createSignal, lazy, onCleanup, onMount } from "solid-js";
 import { DeckList } from "./components/DeckList";
-import { Editor } from "./components/Editor";
 import type { DemoUser, ShareLinkPreview } from "./types";
 import { activeDemoUserId, api, setActiveDemoUserId } from "./api";
 import { deckHash, parseRoute, sameRoute, type Route } from "./routes";
 import { SharedPresentation } from "./components/SharedPresentation";
+
+const Editor = lazy(async () => ({ default: (await import("./components/Editor")).Editor }));
 
 export default function App() {
   const [route, setRoute] = createSignal<Route>(parseRoute());
@@ -107,7 +108,7 @@ export default function App() {
     </main>}>
       {(user) => <Show when={route()} keyed>{(current) =>
         current.view === "editor"
-          ? <Editor deckId={current.id} initialBranch={current.branch} onBack={back} activeDemoUser={user()} onSignOut={signOut} />
+          ? <Suspense fallback={<main class="identity-loading">Opening presentation…</main>}><Editor deckId={current.id} initialBranch={current.branch} onBack={back} activeDemoUser={user()} onSignOut={signOut} /></Suspense>
           : current.view === "share" ? <SharedPresentation deckId={current.id} token={current.token} user={user()} onOpen={open} onBack={back} />
           : <DeckList onOpen={open} activeDemoUser={user()} onSignOut={signOut} />
       }</Show>}

@@ -4,13 +4,14 @@ use crate::jsonutil::{
 };
 use base64::Engine;
 use git2::{BranchType, IndexAddOption, Oid, Repository, RepositoryInitOptions, Signature};
+use hashbrown::{HashMap, HashSet};
 use parking_lot::Mutex;
 use present_domain::*;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 use std::fs;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -48,23 +49,45 @@ struct StoredShareLink {
 
 impl StoredShareLink {
     fn public(&self) -> ShareLink {
-        ShareLink { id: self.id.clone(), token: self.token.clone(), branch: self.branch.clone(), role: self.role, created_at: self.created_at, joined_count: self.member_ids.len() }
+        ShareLink {
+            id: self.id.clone(),
+            token: self.token.clone(),
+            branch: self.branch.clone(),
+            role: self.role,
+            created_at: self.created_at,
+            joined_count: self.member_ids.len(),
+        }
     }
 }
 
 impl DeckCollaborationFile {
     fn member_branches(&self, user_id: &str) -> BTreeMap<String, DeckRole> {
         let mut branches = self.members.get(user_id).cloned().unwrap_or_default();
-        for link in self.share_links.iter().filter(|link| link.member_ids.contains(user_id)) {
-            branches.entry(link.branch.clone()).and_modify(|role| *role = (*role).max(link.role)).or_insert(link.role);
+        for link in self
+            .share_links
+            .iter()
+            .filter(|link| link.member_ids.contains(user_id))
+        {
+            branches
+                .entry(link.branch.clone())
+                .and_modify(|role| *role = (*role).max(link.role))
+                .or_insert(link.role);
         }
         branches
     }
 
     fn effective_members(&self) -> HashMap<String, BTreeMap<String, DeckRole>> {
         let mut users: HashSet<String> = self.members.keys().cloned().collect();
-        for link in &self.share_links { users.extend(link.member_ids.iter().cloned()); }
-        users.into_iter().map(|id| { let branches = self.member_branches(&id); (id, branches) }).collect()
+        for link in &self.share_links {
+            users.extend(link.member_ids.iter().cloned());
+        }
+        users
+            .into_iter()
+            .map(|id| {
+                let branches = self.member_branches(&id);
+                (id, branches)
+            })
+            .collect()
     }
 }
 
@@ -294,7 +317,11 @@ impl AppState {
             HashSet::new()
         } else {
             let branches = data.member_branches(&actor.id);
-            if branches.is_empty() { return Err(AppError::Forbidden("you are not a member of this presentation".into())); }
+            if branches.is_empty() {
+                return Err(AppError::Forbidden(
+                    "you are not a member of this presentation".into(),
+                ));
+            }
             branches.keys().cloned().collect()
         };
         let mut members = Vec::new();
@@ -346,7 +373,13 @@ impl AppState {
             .entry(user.id.clone())
             .or_default()
             .insert(request.branch.clone(), request.role);
-        for link in data.share_links.iter_mut().filter(|link| link.branch == request.branch) { link.member_ids.remove(&user.id); }
+        for link in data
+            .share_links
+            .iter_mut()
+            .filter(|link| link.branch == request.branch)
+        {
+            link.member_ids.remove(&user.id);
+        }
         self.save_collaboration(deck_id, &data)?;
         self.deck_collaboration(deck_id, actor)
     }
@@ -371,56 +404,133 @@ impl AppState {
                 data.members.remove(&user.id);
             }
         }
-        for link in data.share_links.iter_mut().filter(|link| link.branch == branch) { link.member_ids.remove(&user.id); }
+        for link in data
+            .share_links
+            .iter_mut()
+            .filter(|link| link.branch == branch)
+        {
+            link.member_ids.remove(&user.id);
+        }
         self.save_collaboration(deck_id, &data)?;
         self.deck_collaboration(deck_id, actor)
     }
 
     pub fn share_links(&self, deck_id: &str, actor: &DemoUser) -> AppResult<Vec<ShareLink>> {
         let data = self.load_collaboration(deck_id)?;
-        if data.owner_id != actor.id { return Err(AppError::Forbidden("only the presentation creator can manage share links".into())); }
-        Ok(data.share_links.iter().map(StoredShareLink::public).collect())
+        if data.owner_id != actor.id {
+            return Err(AppError::Forbidden(
+                "only the presentation creator can manage share links".into(),
+            ));
+        }
+        Ok(data
+            .share_links
+            .iter()
+            .map(StoredShareLink::public)
+            .collect())
     }
 
-    pub fn create_share_link(&self, deck_id: &str, actor: &DemoUser, request: CreateShareLinkRequest) -> AppResult<ShareLink> {
+    pub fn create_share_link(
+        &self,
+        deck_id: &str,
+        actor: &DemoUser,
+        request: CreateShareLinkRequest,
+    ) -> AppResult<ShareLink> {
         let mut data = self.load_collaboration(deck_id)?;
-        if data.owner_id != actor.id { return Err(AppError::Forbidden("only the presentation creator can manage share links".into())); }
-        if data.share_links.len() >= 50 { return Err(AppError::BadRequest("Revoke an existing link before creating more share links.".into())); }
-        self.open_repo(deck_id)?.find_branch(&request.branch, BranchType::Local)
+        if data.owner_id != actor.id {
+            return Err(AppError::Forbidden(
+                "only the presentation creator can manage share links".into(),
+            ));
+        }
+        if data.share_links.len() >= 50 {
+            return Err(AppError::BadRequest(
+                "Revoke an existing link before creating more share links.".into(),
+            ));
+        }
+        self.open_repo(deck_id)?
+            .find_branch(&request.branch, BranchType::Local)
             .map_err(|_| AppError::NotFound("the selected branch no longer exists".into()))?;
-        let link = StoredShareLink { id: format!("link_{}", Uuid::new_v4().simple()), token: Uuid::new_v4().simple().to_string(), branch: request.branch, role: request.role, created_at: now_secs(), member_ids: HashSet::new() };
+        let link = StoredShareLink {
+            id: format!("link_{}", Uuid::new_v4().simple()),
+            token: Uuid::new_v4().simple().to_string(),
+            branch: request.branch,
+            role: request.role,
+            created_at: now_secs(),
+            member_ids: HashSet::new(),
+        };
         let result = link.public();
         data.share_links.push(link);
         self.save_collaboration(deck_id, &data)?;
         Ok(result)
     }
 
-    pub fn revoke_share_link(&self, deck_id: &str, actor: &DemoUser, link_id: &str) -> AppResult<()> {
+    pub fn revoke_share_link(
+        &self,
+        deck_id: &str,
+        actor: &DemoUser,
+        link_id: &str,
+    ) -> AppResult<()> {
         let mut data = self.load_collaboration(deck_id)?;
-        if data.owner_id != actor.id { return Err(AppError::Forbidden("only the presentation creator can manage share links".into())); }
+        if data.owner_id != actor.id {
+            return Err(AppError::Forbidden(
+                "only the presentation creator can manage share links".into(),
+            ));
+        }
         let previous = data.share_links.len();
         data.share_links.retain(|link| link.id != link_id);
-        if previous == data.share_links.len() { return Err(AppError::NotFound("share link not found".into())); }
+        if previous == data.share_links.len() {
+            return Err(AppError::NotFound("share link not found".into()));
+        }
         self.save_collaboration(deck_id, &data)
     }
 
     pub fn share_link_preview(&self, deck_id: &str, token: &str) -> AppResult<ShareLinkPreview> {
-        let unavailable = || AppError::NotFound("This sharing link is invalid or has been revoked.".into());
-        if token.len() != 32 || !token.chars().all(|ch| ch.is_ascii_hexdigit()) { return Err(unavailable()); }
-        let data = self.load_collaboration(deck_id).map_err(|_| unavailable())?;
-        let link = data.share_links.iter().find(|link| link.token == token).ok_or_else(unavailable)?;
-        let repo = self.repo_for_branch(deck_id, &link.branch).map_err(|_| unavailable())?;
+        let unavailable =
+            || AppError::NotFound("This sharing link is invalid or has been revoked.".into());
+        if token.len() != 32 || !token.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return Err(unavailable());
+        }
+        let data = self
+            .load_collaboration(deck_id)
+            .map_err(|_| unavailable())?;
+        let link = data
+            .share_links
+            .iter()
+            .find(|link| link.token == token)
+            .ok_or_else(unavailable)?;
+        let repo = self
+            .repo_for_branch(deck_id, &link.branch)
+            .map_err(|_| unavailable())?;
         let deck: Deck = read_json(&workdir(&repo)?.join("deck.json"))?;
-        Ok(ShareLinkPreview { deck_id: deck_id.to_owned(), title: deck.title, branch: link.branch.clone(), role: link.role, owner: self.demo_user(&data.owner_id)? })
+        Ok(ShareLinkPreview {
+            deck_id: deck_id.to_owned(),
+            title: deck.title,
+            branch: link.branch.clone(),
+            role: link.role,
+            owner: self.demo_user(&data.owner_id)?,
+        })
     }
 
-    pub fn join_share_link(&self, deck_id: &str, token: &str, actor: &DemoUser) -> AppResult<ShareLinkPreview> {
+    pub fn join_share_link(
+        &self,
+        deck_id: &str,
+        token: &str,
+        actor: &DemoUser,
+    ) -> AppResult<ShareLinkPreview> {
         let preview = self.share_link_preview(deck_id, token)?;
         let mut data = self.load_collaboration(deck_id)?;
-        if data.owner_id == actor.id { return Ok(preview); }
-        let link = data.share_links.iter_mut().find(|link| link.token == token)
-            .ok_or_else(|| AppError::NotFound("This sharing link is invalid or has been revoked.".into()))?;
-        if link.member_ids.insert(actor.id.clone()) { self.save_collaboration(deck_id, &data)?; }
+        if data.owner_id == actor.id {
+            return Ok(preview);
+        }
+        let link = data
+            .share_links
+            .iter_mut()
+            .find(|link| link.token == token)
+            .ok_or_else(|| {
+                AppError::NotFound("This sharing link is invalid or has been revoked.".into())
+            })?;
+        if link.member_ids.insert(actor.id.clone()) {
+            self.save_collaboration(deck_id, &data)?;
+        }
         Ok(preview)
     }
 
@@ -976,11 +1086,9 @@ impl AppState {
         let reference = root
             .find_branch(branch, BranchType::Local)
             .map_err(|_| AppError::NotFound(format!("branch '{branch}' not found")))?;
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        branch.hash(&mut hasher);
-        let key = format!("room-{:016x}", hasher.finish());
         let room_root = self.decks_root.join(".worktrees").join(deck_id);
         fs::create_dir_all(&room_root)?;
+        let key = worktree_name(&room_root, branch);
         let path = room_root.join(&key);
         if !path.exists() {
             let mut opts = git2::WorktreeAddOptions::new();
@@ -2312,14 +2420,9 @@ impl AppState {
                 "switch branches before deleting the current branch".into(),
             ));
         }
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        name.hash(&mut hasher);
-        let worktree_name = format!("room-{:016x}", hasher.finish());
-        let worktree_path = self
-            .decks_root
-            .join(".worktrees")
-            .join(id)
-            .join(&worktree_name);
+        let room_root = self.decks_root.join(".worktrees").join(id);
+        let worktree_name = worktree_name(&room_root, name);
+        let worktree_path = room_root.join(&worktree_name);
         if worktree_path.exists() {
             let room = Repository::open(&worktree_path)?;
             if repo_dirty(&room)? {
@@ -2725,6 +2828,21 @@ fn head_info(repo: &Repository) -> AppResult<(String, i64)> {
     Ok((branch, time))
 }
 
+fn worktree_name(room_root: &Path, branch: &str) -> String {
+    // Worktree paths must be stable across process restarts. Keep using the
+    // existing path for branches created before the ahash switch.
+    let mut legacy = std::collections::hash_map::DefaultHasher::new();
+    branch.hash(&mut legacy);
+    let legacy_name = format!("room-{:016x}", legacy.finish());
+    if room_root.join(&legacy_name).exists() {
+        return legacy_name;
+    }
+
+    let mut hasher = ahash::RandomState::with_seeds(1, 2, 3, 4).build_hasher();
+    branch.hash(&mut hasher);
+    format!("room-{:016x}", hasher.finish())
+}
+
 fn short_id() -> String {
     let mut id = Uuid::new_v4().simple().to_string();
     id.truncate(8);
@@ -3108,7 +3226,12 @@ fn validate_template_bundle(bundle: &TemplateBundle) -> AppResult<()> {
     Ok(())
 }
 
-fn seed_bundle_deck(path: &Path, deck_id: &str, title: &str, bundle: &TemplateBundle) -> AppResult<()> {
+fn seed_bundle_deck(
+    path: &Path,
+    deck_id: &str,
+    title: &str,
+    bundle: &TemplateBundle,
+) -> AppResult<()> {
     let slides = if bundle.initial_slides.is_empty() {
         vec![Slide::blank("s_01_blank", "Slide 1")]
     } else {
@@ -3132,8 +3255,14 @@ fn seed_bundle_deck(path: &Path, deck_id: &str, title: &str, bundle: &TemplateBu
             element_ids.insert(old_key, element.id.clone());
             element_ids.insert(old_id, element.id.clone());
             if element.kind == "image" {
-                if let Some(src) = element.src.as_deref().filter(|src| src.starts_with("data:")) {
-                    let (header, encoded) = src.split_once(";base64,").ok_or_else(|| AppError::BadRequest("Embedded images must use base64 data URLs".into()))?;
+                if let Some(src) = element
+                    .src
+                    .as_deref()
+                    .filter(|src| src.starts_with("data:"))
+                {
+                    let (header, encoded) = src.split_once(";base64,").ok_or_else(|| {
+                        AppError::BadRequest("Embedded images must use base64 data URLs".into())
+                    })?;
                     let extension = match header {
                         "data:image/png" => "png",
                         "data:image/jpeg" => "jpg",
@@ -3143,12 +3272,23 @@ fn seed_bundle_deck(path: &Path, deck_id: &str, title: &str, bundle: &TemplateBu
                         "data:image/avif" => "avif",
                         "data:image/bmp" => "bmp",
                         "data:image/tiff" => "tiff",
-                        _ => return Err(AppError::BadRequest("Unsupported embedded image format".into())),
+                        _ => {
+                            return Err(AppError::BadRequest(
+                                "Unsupported embedded image format".into(),
+                            ))
+                        }
                     };
-                    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)
-                        .map_err(|_| AppError::BadRequest("An embedded image contains invalid base64 data".into()))?;
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(encoded)
+                        .map_err(|_| {
+                            AppError::BadRequest(
+                                "An embedded image contains invalid base64 data".into(),
+                            )
+                        })?;
                     if bytes.len() > 100 * 1024 * 1024 {
-                        return Err(AppError::BadRequest("Embedded images must be 100 MiB or smaller".into()));
+                        return Err(AppError::BadRequest(
+                            "Embedded images must be 100 MiB or smaller".into(),
+                        ));
                     }
                     let name = format!("imported-{}.{}", element.id, extension);
                     write_atomic(&slide_dir.join("assets").join(&name), &bytes)?;
@@ -3620,35 +3760,112 @@ mod save_regression_tests {
         let fixture = Fixture::new();
         let state = &fixture.state;
         let user = state.create_demo_user("link_recipient").unwrap();
-        state.create_branch("deck", CreateBranchRequest { name: "feature/shared".into(), from: Some("main".into()), checkout: false, session_id: None }, &fixture.actor).unwrap();
-        let view = state.create_share_link("deck", &fixture.actor, CreateShareLinkRequest { branch: "feature/shared".into(), role: DeckRole::View }).unwrap();
-        let edit = state.create_share_link("deck", &fixture.actor, CreateShareLinkRequest { branch: "feature/shared".into(), role: DeckRole::Edit }).unwrap();
+        state
+            .create_branch(
+                "deck",
+                CreateBranchRequest {
+                    name: "feature/shared".into(),
+                    from: Some("main".into()),
+                    checkout: false,
+                    session_id: None,
+                },
+                &fixture.actor,
+            )
+            .unwrap();
+        let view = state
+            .create_share_link(
+                "deck",
+                &fixture.actor,
+                CreateShareLinkRequest {
+                    branch: "feature/shared".into(),
+                    role: DeckRole::View,
+                },
+            )
+            .unwrap();
+        let edit = state
+            .create_share_link(
+                "deck",
+                &fixture.actor,
+                CreateShareLinkRequest {
+                    branch: "feature/shared".into(),
+                    role: DeckRole::Edit,
+                },
+            )
+            .unwrap();
         assert_ne!(view.token, edit.token);
-        assert_eq!(state.deck_role("deck", &user.id, "feature/shared").unwrap(), None);
+        assert_eq!(
+            state.deck_role("deck", &user.id, "feature/shared").unwrap(),
+            None
+        );
         let preview = state.share_link_preview("deck", &view.token).unwrap();
         assert_eq!(preview.branch, "feature/shared");
         assert_eq!(preview.role, DeckRole::View);
         state.join_share_link("deck", &view.token, &user).unwrap();
         state.join_share_link("deck", &view.token, &user).unwrap();
-        assert_eq!(state.share_links("deck", &fixture.actor).unwrap()[0].joined_count, 1);
-        assert_eq!(state.deck_role("deck", &user.id, "feature/shared").unwrap(), Some(DeckRole::View));
+        assert_eq!(
+            state.share_links("deck", &fixture.actor).unwrap()[0].joined_count,
+            1
+        );
+        assert_eq!(
+            state.deck_role("deck", &user.id, "feature/shared").unwrap(),
+            Some(DeckRole::View)
+        );
         assert_eq!(state.deck_role("deck", &user.id, "main").unwrap(), None);
-        assert!(state.require_deck_role("deck", &user, "feature/shared", DeckRole::Edit).is_err());
-        assert_eq!(state.preferred_branch("deck", &user).unwrap(), "feature/shared");
+        assert!(state
+            .require_deck_role("deck", &user, "feature/shared", DeckRole::Edit)
+            .is_err());
+        assert_eq!(
+            state.preferred_branch("deck", &user).unwrap(),
+            "feature/shared"
+        );
         assert_eq!(state.branches_for_user("deck", &user).unwrap().len(), 1);
-        assert_eq!(state.list_decks_for_user(&user).unwrap()[0].current_branch, "feature/shared");
-        assert_eq!(state.deck_collaboration("deck", &user).unwrap().members[0].branches["feature/shared"], DeckRole::View);
+        assert_eq!(
+            state.list_decks_for_user(&user).unwrap()[0].current_branch,
+            "feature/shared"
+        );
+        assert_eq!(
+            state.deck_collaboration("deck", &user).unwrap().members[0].branches["feature/shared"],
+            DeckRole::View
+        );
         let restarted = AppState::new(fixture.root.join("decks"));
-        assert_eq!(restarted.deck_role("deck", &user.id, "feature/shared").unwrap(), Some(DeckRole::View));
-        state.revoke_share_link("deck", &fixture.actor, &view.id).unwrap();
-        assert_eq!(state.deck_role("deck", &user.id, "feature/shared").unwrap(), None);
+        assert_eq!(
+            restarted
+                .deck_role("deck", &user.id, "feature/shared")
+                .unwrap(),
+            Some(DeckRole::View)
+        );
+        state
+            .revoke_share_link("deck", &fixture.actor, &view.id)
+            .unwrap();
+        assert_eq!(
+            state.deck_role("deck", &user.id, "feature/shared").unwrap(),
+            None
+        );
         assert!(state.join_share_link("deck", &view.token, &user).is_err());
         assert!(state.list_decks_for_user(&user).unwrap().is_empty());
-        state.set_deck_member("deck", &fixture.actor, SetDeckMemberRequest { username: user.username.clone(), branch: "feature/shared".into(), role: DeckRole::Comment }).unwrap();
+        state
+            .set_deck_member(
+                "deck",
+                &fixture.actor,
+                SetDeckMemberRequest {
+                    username: user.username.clone(),
+                    branch: "feature/shared".into(),
+                    role: DeckRole::Comment,
+                },
+            )
+            .unwrap();
         state.join_share_link("deck", &edit.token, &user).unwrap();
-        assert_eq!(state.deck_role("deck", &user.id, "feature/shared").unwrap(), Some(DeckRole::Edit));
-        state.revoke_share_link("deck", &fixture.actor, &edit.id).unwrap();
-        assert_eq!(state.deck_role("deck", &user.id, "feature/shared").unwrap(), Some(DeckRole::Comment));
+        assert_eq!(
+            state.deck_role("deck", &user.id, "feature/shared").unwrap(),
+            Some(DeckRole::Edit)
+        );
+        state
+            .revoke_share_link("deck", &fixture.actor, &edit.id)
+            .unwrap();
+        assert_eq!(
+            state.deck_role("deck", &user.id, "feature/shared").unwrap(),
+            Some(DeckRole::Comment)
+        );
         assert!(state.share_link_preview("other-deck", &edit.token).is_err());
     }
 
@@ -3657,19 +3874,67 @@ mod save_regression_tests {
         let fixture = Fixture::new();
         let state = &fixture.state;
         let user = state.create_demo_user("shared_editor").unwrap();
-        let link = state.create_share_link("deck", &fixture.actor, CreateShareLinkRequest { branch: "main".into(), role: DeckRole::Edit }).unwrap();
+        let link = state
+            .create_share_link(
+                "deck",
+                &fixture.actor,
+                CreateShareLinkRequest {
+                    branch: "main".into(),
+                    role: DeckRole::Edit,
+                },
+            )
+            .unwrap();
         state.join_share_link("deck", &link.token, &user).unwrap();
-        assert!(matches!(state.create_share_link("deck", &user, CreateShareLinkRequest { branch: "main".into(), role: DeckRole::Edit }), Err(AppError::Forbidden(_))));
-        assert!(matches!(state.share_links("deck", &user), Err(AppError::Forbidden(_))));
-        assert!(matches!(state.revoke_share_link("deck", &user, &link.id), Err(AppError::Forbidden(_))));
-        state.remove_deck_member("deck", &fixture.actor, &user.username, "main").unwrap();
+        assert!(matches!(
+            state.create_share_link(
+                "deck",
+                &user,
+                CreateShareLinkRequest {
+                    branch: "main".into(),
+                    role: DeckRole::Edit
+                }
+            ),
+            Err(AppError::Forbidden(_))
+        ));
+        assert!(matches!(
+            state.share_links("deck", &user),
+            Err(AppError::Forbidden(_))
+        ));
+        assert!(matches!(
+            state.revoke_share_link("deck", &user, &link.id),
+            Err(AppError::Forbidden(_))
+        ));
+        state
+            .remove_deck_member("deck", &fixture.actor, &user.username, "main")
+            .unwrap();
         assert_eq!(state.deck_role("deck", &user.id, "main").unwrap(), None);
-        assert_eq!(state.share_links("deck", &fixture.actor).unwrap()[0].joined_count, 0);
+        assert_eq!(
+            state.share_links("deck", &fixture.actor).unwrap()[0].joined_count,
+            0
+        );
         state.join_share_link("deck", &link.token, &user).unwrap();
-        state.set_deck_member("deck", &fixture.actor, SetDeckMemberRequest { username: user.username.clone(), branch: "main".into(), role: DeckRole::View }).unwrap();
-        assert_eq!(state.deck_role("deck", &user.id, "main").unwrap(), Some(DeckRole::View));
-        state.revoke_share_link("deck", &fixture.actor, &link.id).unwrap();
-        assert_eq!(state.deck_role("deck", &user.id, "main").unwrap(), Some(DeckRole::View));
+        state
+            .set_deck_member(
+                "deck",
+                &fixture.actor,
+                SetDeckMemberRequest {
+                    username: user.username.clone(),
+                    branch: "main".into(),
+                    role: DeckRole::View,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            state.deck_role("deck", &user.id, "main").unwrap(),
+            Some(DeckRole::View)
+        );
+        state
+            .revoke_share_link("deck", &fixture.actor, &link.id)
+            .unwrap();
+        assert_eq!(
+            state.deck_role("deck", &user.id, "main").unwrap(),
+            Some(DeckRole::View)
+        );
     }
 
     #[test]
@@ -3677,12 +3942,40 @@ mod save_regression_tests {
         let fixture = Fixture::new();
         let state = &fixture.state;
         let user = state.create_demo_user("branch_viewer").unwrap();
-        state.create_branch("deck", CreateBranchRequest { name: "temporary".into(), from: Some("main".into()), checkout: false, session_id: None }, &fixture.actor).unwrap();
-        let link = state.create_share_link("deck", &fixture.actor, CreateShareLinkRequest { branch: "temporary".into(), role: DeckRole::View }).unwrap();
+        state
+            .create_branch(
+                "deck",
+                CreateBranchRequest {
+                    name: "temporary".into(),
+                    from: Some("main".into()),
+                    checkout: false,
+                    session_id: None,
+                },
+                &fixture.actor,
+            )
+            .unwrap();
+        let link = state
+            .create_share_link(
+                "deck",
+                &fixture.actor,
+                CreateShareLinkRequest {
+                    branch: "temporary".into(),
+                    role: DeckRole::View,
+                },
+            )
+            .unwrap();
         state.join_share_link("deck", &link.token, &user).unwrap();
-        state.delete_branch("deck", "temporary", &fixture.actor).unwrap();
-        assert!(state.share_links("deck", &fixture.actor).unwrap().is_empty());
-        assert_eq!(state.deck_role("deck", &user.id, "temporary").unwrap(), None);
+        state
+            .delete_branch("deck", "temporary", &fixture.actor)
+            .unwrap();
+        assert!(state
+            .share_links("deck", &fixture.actor)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            state.deck_role("deck", &user.id, "temporary").unwrap(),
+            None
+        );
         assert!(state.share_link_preview("deck", &link.token).is_err());
     }
 
@@ -3767,7 +4060,11 @@ mod save_regression_tests {
         let fixture = Fixture::new();
         let state = &fixture.state;
         let session = state
-            .create_session_as("deck", CreateSessionRequest { branch: None }, &fixture.actor)
+            .create_session_as(
+                "deck",
+                CreateSessionRequest { branch: None },
+                &fixture.actor,
+            )
             .unwrap();
         let base = fixture.slide.clone();
         let element_id = base.elements.keys().next().unwrap().clone();
@@ -3778,29 +4075,67 @@ mod save_regression_tests {
             .unwrap();
             let req = state.rebase_slide_write("deck", &base.id, req).unwrap();
             state
-                .assert_slide_locks("deck", &base.id, Some(&session.id), &fixture.actor, &req.slide)
+                .assert_slide_locks(
+                    "deck",
+                    &base.id,
+                    Some(&session.id),
+                    &fixture.actor,
+                    &req.slide,
+                )
                 .unwrap();
-            state.write_slide("deck", &base.id, req, &fixture.actor).unwrap().slide
+            state
+                .write_slide("deck", &base.id, req, &fixture.actor)
+                .unwrap()
+                .slide
         };
-        let read = || state.read_slide_for_session("deck", &base.id, &session.id).unwrap().slide;
+        let read = || {
+            state
+                .read_slide_for_session("deck", &base.id, &session.id)
+                .unwrap()
+                .slide
+        };
 
         let mut draft = base.clone();
         draft.animations = serde_json::from_value(json!([{
             "id": "anim_entrance", "elementId": element_id, "effect": "fade",
             "order": 0, "durationMs": 500, "delayMs": 100,
             "trigger": "click", "direction": "up",
-        }])).unwrap();
+        }]))
+        .unwrap();
         draft.transition = serde_json::from_value(json!({
             "effect": "push", "durationMs": 600, "direction": "left",
-        })).unwrap();
+        }))
+        .unwrap();
         let added = save(&draft, &base);
-        assert_eq!(added.animations, draft.animations, "save response lost the animation");
-        assert_eq!(added.transition, draft.transition, "save response lost the transition");
-        assert_eq!(read().animations, draft.animations, "animation was not stored");
-        assert_eq!(read().transition, draft.transition, "transition was not stored");
+        assert_eq!(
+            added.animations, draft.animations,
+            "save response lost the animation"
+        );
+        assert_eq!(
+            added.transition, draft.transition,
+            "save response lost the transition"
+        );
+        assert_eq!(
+            read().animations,
+            draft.animations,
+            "animation was not stored"
+        );
+        assert_eq!(
+            read().transition,
+            draft.transition,
+            "transition was not stored"
+        );
 
         // A stale object-only edit must retain playback settings it never changed.
-        state.acquire_session_locks("deck", "main", &fixture.actor, Some(&session.id), &[element_id.clone()]).unwrap();
+        state
+            .acquire_session_locks(
+                "deck",
+                "main",
+                &fixture.actor,
+                Some(&session.id),
+                &[element_id.clone()],
+            )
+            .unwrap();
         let mut object_edit = base.clone();
         object_edit.elements.get_mut(&element_id).unwrap().x += 20.0;
         let latest = save(&object_edit, &base);
@@ -3845,17 +4180,41 @@ mod save_regression_tests {
         })).unwrap();
         let detail = fixture.state.create_deck_as(req, &fixture.actor).unwrap();
         assert_eq!(detail.slides.len(), 1);
-        let payload = fixture.state.read_slide("imported-deck", &detail.slides[0].id).unwrap();
+        let payload = fixture
+            .state
+            .read_slide("imported-deck", &detail.slides[0].id)
+            .unwrap();
         let element = payload.slide.elements.values().next().unwrap();
         assert_ne!(element.id, "original_image");
         assert_eq!(payload.slide.animations[0].element_id, element.id);
         assert_eq!(payload.assets.len(), 1);
         assert_eq!(element.src.as_deref(), Some(payload.assets[0].url.as_str()));
-        let (bytes, mime) = fixture.state.read_asset("imported-deck", &payload.slide.id, &payload.assets[0].name, None).unwrap();
-        assert_eq!(bytes, base64::engine::general_purpose::STANDARD.decode(image).unwrap());
+        let (bytes, mime) = fixture
+            .state
+            .read_asset(
+                "imported-deck",
+                &payload.slide.id,
+                &payload.assets[0].name,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            bytes,
+            base64::engine::general_purpose::STANDARD
+                .decode(image)
+                .unwrap()
+        );
         assert_eq!(mime, "image/png");
-        let metadata: TemplateBundle = read_json(&fixture.root.join("decks/imported-deck/.present/template-bundle.json")).unwrap();
-        assert!(metadata.initial_slides.is_empty(), "image payloads should not be duplicated in template metadata");
+        let metadata: TemplateBundle = read_json(
+            &fixture
+                .root
+                .join("decks/imported-deck/.present/template-bundle.json"),
+        )
+        .unwrap();
+        assert!(
+            metadata.initial_slides.is_empty(),
+            "image payloads should not be duplicated in template metadata"
+        );
     }
 
     #[test]

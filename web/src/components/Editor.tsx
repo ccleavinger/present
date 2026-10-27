@@ -1,9 +1,11 @@
 import {
   For,
   Show,
+  Suspense,
   createEffect,
   createMemo,
   createSignal,
+  lazy,
   onCleanup,
   onMount,
   untrack,
@@ -39,7 +41,6 @@ import { ThumbnailRail } from "./ThumbnailRail";
 import { Toolbar } from "./Toolbar";
 import { Inspector } from "./Inspector";
 import { NotesDrawer } from "./NotesDrawer";
-import { BuildModal } from "./BuildModal";
 import { TimelineModal } from "./TimelineModal";
 import { Modal } from "./Modal";
 import ScriptWorker from "../worker/scriptWorker?worker";
@@ -63,6 +64,7 @@ type SaveState = "saved" | "dirty" | "saving" | "retrying" | "error";
 type Toast = { message: string; kind: "info" | "success" | "error" };
 type ImageDestination = { slideId: string; sessionId?: string; width: number; height: number };
 const MAX_IMAGE_FILE_BYTES = 100 * 1024 * 1024;
+const BuildModal = lazy(async () => ({ default: (await import("./BuildModal")).BuildModal }));
 const QR_CODE_TYPE: CustomObjectDefinition = {
   id: "qr-code",
   name: "QR code",
@@ -1760,18 +1762,20 @@ export function Editor(props: EditorProps) {
       </Show>
 
       <Show when={buildOpen() && slide()}>
-        <BuildModal
-          deckId={props.deckId}
-          deckTitle={deck()?.deck.title ?? "Presentation"}
-          deckSlides={Object.values({ ...previews(), [slide()!.id]: slide()! }).slice(-20)}
-          sessionId={sessionId() ?? undefined}
-          slide={slide()!}
-          selection={selectedIds()}
-          customObjectTypes={customObjectTypes()}
-          onClose={() => setBuildOpen(false)}
-          onApplyScript={applyScript}
-          onApplyAgent={applyAgentProposal}
-        />
+        <Suspense fallback={<Modal title="Build workspace" subtitle="Loading tools…" onClose={() => setBuildOpen(false)}><p class="muted">Preparing the scripting and agent tools…</p></Modal>}>
+          <BuildModal
+            deckId={props.deckId}
+            deckTitle={deck()?.deck.title ?? "Presentation"}
+            deckSlides={Object.values({ ...previews(), [slide()!.id]: slide()! }).slice(-20)}
+            sessionId={sessionId() ?? undefined}
+            slide={slide()!}
+            selection={selectedIds()}
+            customObjectTypes={customObjectTypes()}
+            onClose={() => setBuildOpen(false)}
+            onApplyScript={applyScript}
+            onApplyAgent={applyAgentProposal}
+          />
+        </Suspense>
       </Show>
 
       <Show when={slidePickerOpen()}>

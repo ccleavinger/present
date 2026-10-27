@@ -8,24 +8,21 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
+use hashbrown::HashMap;
 use parking_lot::Mutex;
 use present_domain::*;
 use present_merge as merge;
 use present_store::{AppError, AppState};
 use serde::Deserialize;
-use std::sync::Arc;
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    OnceLock,
-};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 use tokio::sync::broadcast;
 
 const MAX_ASSET_UPLOAD_BYTES: usize = 100 * 1024 * 1024;
-static PRESENCE_ROOMS: OnceLock<
-    Mutex<std::collections::HashMap<String, broadcast::Sender<String>>>,
-> = OnceLock::new();
-static ACCOUNT_EVENTS: OnceLock<broadcast::Sender<(String, Option<String>, String)>> =
-    OnceLock::new();
+static PRESENCE_ROOMS: LazyLock<Mutex<HashMap<String, broadcast::Sender<String>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static ACCOUNT_EVENTS: LazyLock<broadcast::Sender<(String, Option<String>, String)>> =
+    LazyLock::new(|| broadcast::channel(256).0);
 static NEXT_PRESENCE_CONNECTION: AtomicU64 = AtomicU64::new(1);
 
 type ApiResult<T> = Result<T, ApiError>;
@@ -101,8 +98,14 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/decks/{deck}/collaboration/members",
             post(set_collaborator).delete(remove_collaborator),
         )
-        .route("/decks/{deck}/collaboration/links", get(list_share_links).post(create_share_link))
-        .route("/decks/{deck}/collaboration/links/{link}", delete(revoke_share_link))
+        .route(
+            "/decks/{deck}/collaboration/links",
+            get(list_share_links).post(create_share_link),
+        )
+        .route(
+            "/decks/{deck}/collaboration/links/{link}",
+            delete(revoke_share_link),
+        )
         .route(
             "/decks/{deck}/comments",
             get(list_comments).post(add_comment),
@@ -132,10 +135,14 @@ async fn require_demo_user(
     next: Next,
 ) -> Response {
     let path = normalized_api_path(request.uri().path());
-    if path == "/health" || path == "/users" || path == "/users/sign-in" || public_share_preview(request.method(), &path) {
+    if path == "/health"
+        || path == "/users"
+        || path == "/users/sign-in"
+        || public_share_preview(request.method(), &path)
+    {
         return next.run(request).await;
     }
-    let query = Query::<std::collections::HashMap<String, String>>::try_from_uri(request.uri())
+    let query = Query::<HashMap<String, String>>::try_from_uri(request.uri())
         .map(|Query(values)| values)
         .unwrap_or_default();
     let contextual_asset = request.method() == Method::GET
@@ -199,7 +206,9 @@ async fn require_demo_user(
                         }
                         Err(error) => return ApiError::from(error).into_response(),
                     }
-                } else if path.ends_with("/collaboration/members") || path.contains("/collaboration/links") {
+                } else if path.ends_with("/collaboration/members")
+                    || path.contains("/collaboration/links")
+                {
                     match state.is_deck_owner(deck_id, &user) {
                         Ok(true) => {}
                         Ok(false) => {
@@ -243,9 +252,7 @@ async fn require_demo_user(
 }
 
 fn account_events() -> broadcast::Sender<(String, Option<String>, String)> {
-    ACCOUNT_EVENTS
-        .get_or_init(|| broadcast::channel(256).0)
-        .clone()
+    ACCOUNT_EVENTS.clone()
 }
 
 async fn account_socket(
@@ -290,7 +297,7 @@ async fn account_socket(
 fn mutation_notice(
     state: &AppState,
     request: &Request,
-    query: &std::collections::HashMap<String, String>,
+    query: &HashMap<String, String>,
     actor: &DemoUser,
 ) -> Option<(String, Option<String>, serde_json::Value)> {
     let method = request.method();
@@ -346,8 +353,7 @@ fn mutation_notice(
 }
 
 fn broadcast_deck(deck: &str, message: String) {
-    let rooms = PRESENCE_ROOMS.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-    for (room, sender) in rooms.lock().iter() {
+    for (room, sender) in PRESENCE_ROOMS.lock().iter() {
         if room.starts_with(&format!("{deck}:")) {
             let _ = sender.send(message.clone());
         }
@@ -379,15 +385,14 @@ fn public_share_preview(method: &Method, path: &str) -> bool {
     matches!(*method, Method::GET | Method::HEAD) && parts.len() == 3 && parts[0] == "share"
 }
 
-fn query_value<'a>(
-    query: &'a std::collections::HashMap<String, String>,
-    key: &str,
-) -> Option<&'a str> {
+fn query_value<'a>(query: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
     query.get(key).map(String::as_str)
 }
 
 #[cfg(test)]
 mod identity_path_tests {
+    use hashbrown::HashMap;
+
     use super::{normalized_api_path, query_value};
 
     #[test]
@@ -408,8 +413,7 @@ mod identity_path_tests {
             .parse()
             .unwrap();
         let axum::extract::Query(query) =
-            axum::extract::Query::<std::collections::HashMap<String, String>>::try_from_uri(&uri)
-                .unwrap();
+            axum::extract::Query::<HashMap<String, String>>::try_from_uri(&uri).unwrap();
         assert_eq!(query_value(&query, "branch"), Some("feature/slides"));
         assert_eq!(query_value(&query, "demoUserId"), Some("usr_123"));
         assert!(query_value(&query, "sessionId").is_none());
@@ -425,43 +429,233 @@ mod demo_identity_api_tests {
 
     #[tokio::test]
     async fn share_link_join_is_authenticated_scoped_and_revocable() {
-        fn request(method: Method, path: &str, user: Option<&str>, body: serde_json::Value) -> Request<Body> {
-            let mut builder = Request::builder().method(method).uri(path).header("content-type", "application/json");
-            if let Some(user) = user { builder = builder.header("X-Present-User", user); }
+        fn request(
+            method: Method,
+            path: &str,
+            user: Option<&str>,
+            body: serde_json::Value,
+        ) -> Request<Body> {
+            let mut builder = Request::builder()
+                .method(method)
+                .uri(path)
+                .header("content-type", "application/json");
+            if let Some(user) = user {
+                builder = builder.header("X-Present-User", user);
+            }
             builder.body(Body::from(body.to_string())).unwrap()
         }
-        let root = std::env::temp_dir().join(format!("present-share-api-{}", NEXT_PRESENCE_CONNECTION.fetch_add(1, Ordering::Relaxed)));
+        let root = std::env::temp_dir().join(format!(
+            "present-share-api-{}",
+            NEXT_PRESENCE_CONNECTION.fetch_add(1, Ordering::Relaxed)
+        ));
         let state = Arc::new(AppState::new(root.join("decks")));
         let owner = state.create_demo_user("link_owner").unwrap();
         let recipient = state.create_demo_user("link_recipient").unwrap();
-        let detail = state.create_deck_as(serde_json::from_value(serde_json::json!({"id":"shared-link", "title":"Shared by link"})).unwrap(), &owner).unwrap();
-        state.create_branch("shared-link", CreateBranchRequest { name: "feature/shared".into(), from: Some("main".into()), checkout: false, session_id: None }, &owner).unwrap();
+        let detail = state
+            .create_deck_as(
+                serde_json::from_value(
+                    serde_json::json!({"id":"shared-link", "title":"Shared by link"}),
+                )
+                .unwrap(),
+                &owner,
+            )
+            .unwrap();
+        state
+            .create_branch(
+                "shared-link",
+                CreateBranchRequest {
+                    name: "feature/shared".into(),
+                    from: Some("main".into()),
+                    checkout: false,
+                    session_id: None,
+                },
+                &owner,
+            )
+            .unwrap();
         let app = Router::new().nest("/api", router(state.clone()));
-        let response = app.clone().oneshot(request(Method::POST, "/api/decks/shared-link/collaboration/links", Some(&owner.id), serde_json::json!({"branch":"feature/shared","role":"view"}))).await.unwrap();
+        let response = app
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/api/decks/shared-link/collaboration/links",
+                Some(&owner.id),
+                serde_json::json!({"branch":"feature/shared","role":"view"}),
+            ))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
-        let link: ShareLink = serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+        let link: ShareLink =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
         let url = format!("/api/share/shared-link/{}", link.token);
-        let response = app.clone().oneshot(request(Method::GET, &url, None, serde_json::json!({}))).await.unwrap();
+        let response = app
+            .clone()
+            .oneshot(request(Method::GET, &url, None, serde_json::json!({})))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let preview: ShareLinkPreview = serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+        let preview: ShareLinkPreview =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
         assert_eq!(preview.title, "Shared by link");
         assert_eq!(preview.branch, "feature/shared");
-        assert_eq!(app.clone().oneshot(request(Method::POST, &format!("{url}/join"), None, serde_json::json!({}))).await.unwrap().status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(app.clone().oneshot(request(Method::GET, "/api/decks/shared-link?branch=feature%2Fshared", Some(&recipient.id), serde_json::json!({}))).await.unwrap().status(), StatusCode::FORBIDDEN);
-        assert_eq!(app.clone().oneshot(request(Method::POST, &format!("{url}/join"), Some(&recipient.id), serde_json::json!({}))).await.unwrap().status(), StatusCode::OK);
-        assert_eq!(app.clone().oneshot(request(Method::GET, "/api/decks/shared-link?branch=feature%2Fshared", Some(&recipient.id), serde_json::json!({}))).await.unwrap().status(), StatusCode::OK);
-        assert_eq!(app.clone().oneshot(request(Method::GET, "/api/decks/shared-link?branch=main", Some(&recipient.id), serde_json::json!({}))).await.unwrap().status(), StatusCode::FORBIDDEN);
-        let response = app.clone().oneshot(request(Method::POST, "/api/decks/shared-link/sessions", Some(&recipient.id), serde_json::json!({"branch":"feature/shared"}))).await.unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    Method::POST,
+                    &format!("{url}/join"),
+                    None,
+                    serde_json::json!({})
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    Method::GET,
+                    "/api/decks/shared-link?branch=feature%2Fshared",
+                    Some(&recipient.id),
+                    serde_json::json!({})
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    Method::POST,
+                    &format!("{url}/join"),
+                    Some(&recipient.id),
+                    serde_json::json!({})
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    Method::GET,
+                    "/api/decks/shared-link?branch=feature%2Fshared",
+                    Some(&recipient.id),
+                    serde_json::json!({})
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    Method::GET,
+                    "/api/decks/shared-link?branch=main",
+                    Some(&recipient.id),
+                    serde_json::json!({})
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let response = app
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/api/decks/shared-link/sessions",
+                Some(&recipient.id),
+                serde_json::json!({"branch":"feature/shared"}),
+            ))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
-        let session: serde_json::Value = serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-        let slide_url = format!("/api/decks/shared-link/slides/{}?sessionId={}", detail.slides[0].id, session["id"].as_str().unwrap());
-        assert_eq!(app.clone().oneshot(request(Method::PUT, &slide_url, Some(&recipient.id), serde_json::json!({}))).await.unwrap().status(), StatusCode::FORBIDDEN);
-        assert_eq!(app.clone().oneshot(request(Method::GET, "/api/decks/shared-link/collaboration/links", Some(&recipient.id), serde_json::json!({}))).await.unwrap().status(), StatusCode::FORBIDDEN);
+        let session: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let slide_url = format!(
+            "/api/decks/shared-link/slides/{}?sessionId={}",
+            detail.slides[0].id,
+            session["id"].as_str().unwrap()
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    Method::PUT,
+                    &slide_url,
+                    Some(&recipient.id),
+                    serde_json::json!({})
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    Method::GET,
+                    "/api/decks/shared-link/collaboration/links",
+                    Some(&recipient.id),
+                    serde_json::json!({})
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
         let revoke = format!("/api/decks/shared-link/collaboration/links/{}", link.id);
-        assert_eq!(app.clone().oneshot(request(Method::DELETE, &revoke, Some(&recipient.id), serde_json::json!({}))).await.unwrap().status(), StatusCode::FORBIDDEN);
-        assert_eq!(app.clone().oneshot(request(Method::DELETE, &revoke, Some(&owner.id), serde_json::json!({}))).await.unwrap().status(), StatusCode::NO_CONTENT);
-        assert_eq!(app.clone().oneshot(request(Method::GET, &url, None, serde_json::json!({}))).await.unwrap().status(), StatusCode::NOT_FOUND);
-        assert_eq!(app.oneshot(request(Method::GET, &slide_url, Some(&recipient.id), serde_json::json!({}))).await.unwrap().status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    Method::DELETE,
+                    &revoke,
+                    Some(&recipient.id),
+                    serde_json::json!({})
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    Method::DELETE,
+                    &revoke,
+                    Some(&owner.id),
+                    serde_json::json!({})
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(Method::GET, &url, None, serde_json::json!({})))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            app.oneshot(request(
+                Method::GET,
+                &slide_url,
+                Some(&recipient.id),
+                serde_json::json!({})
+            ))
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::FORBIDDEN
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -649,31 +843,58 @@ async fn get_collaboration(
     Ok(Json(state.deck_collaboration(&deck, &actor)?))
 }
 
-async fn list_share_links(State(state): State<Arc<AppState>>, Path(deck): Path<String>, Extension(actor): Extension<DemoUser>) -> ApiResult<Json<Vec<ShareLink>>> {
+async fn list_share_links(
+    State(state): State<Arc<AppState>>,
+    Path(deck): Path<String>,
+    Extension(actor): Extension<DemoUser>,
+) -> ApiResult<Json<Vec<ShareLink>>> {
     Ok(Json(state.share_links(&deck, &actor)?))
 }
 
-async fn create_share_link(State(state): State<Arc<AppState>>, Path(deck): Path<String>, Extension(actor): Extension<DemoUser>, Json(request): Json<CreateShareLinkRequest>) -> ApiResult<(StatusCode, Json<ShareLink>)> {
+async fn create_share_link(
+    State(state): State<Arc<AppState>>,
+    Path(deck): Path<String>,
+    Extension(actor): Extension<DemoUser>,
+    Json(request): Json<CreateShareLinkRequest>,
+) -> ApiResult<(StatusCode, Json<ShareLink>)> {
     let _guard = lock(&state);
-    Ok((StatusCode::CREATED, Json(state.create_share_link(&deck, &actor, request)?)))
+    Ok((
+        StatusCode::CREATED,
+        Json(state.create_share_link(&deck, &actor, request)?),
+    ))
 }
 
-async fn revoke_share_link(State(state): State<Arc<AppState>>, Path((deck, link)): Path<(String, String)>, Extension(actor): Extension<DemoUser>) -> ApiResult<StatusCode> {
+async fn revoke_share_link(
+    State(state): State<Arc<AppState>>,
+    Path((deck, link)): Path<(String, String)>,
+    Extension(actor): Extension<DemoUser>,
+) -> ApiResult<StatusCode> {
     let _guard = lock(&state);
     state.revoke_share_link(&deck, &actor, &link)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn share_link_preview(State(state): State<Arc<AppState>>, Path((deck, token)): Path<(String, String)>) -> ApiResult<Json<ShareLinkPreview>> {
+async fn share_link_preview(
+    State(state): State<Arc<AppState>>,
+    Path((deck, token)): Path<(String, String)>,
+) -> ApiResult<Json<ShareLinkPreview>> {
     Ok(Json(state.share_link_preview(&deck, &token)?))
 }
 
-async fn join_share_link(State(state): State<Arc<AppState>>, Path((deck, token)): Path<(String, String)>, Extension(actor): Extension<DemoUser>) -> ApiResult<Json<ShareLinkPreview>> {
+async fn join_share_link(
+    State(state): State<Arc<AppState>>,
+    Path((deck, token)): Path<(String, String)>,
+    Extension(actor): Extension<DemoUser>,
+) -> ApiResult<Json<ShareLinkPreview>> {
     let result = {
         let _guard = lock(&state);
         state.join_share_link(&deck, &token, &actor)?
     };
-    broadcast_deck(&deck, serde_json::json!({"type":"invalidate", "scope":"collaboration", "userId":actor.id}).to_string());
+    broadcast_deck(
+        &deck,
+        serde_json::json!({"type":"invalidate", "scope":"collaboration", "userId":actor.id})
+            .to_string(),
+    );
     let _ = account_events().send((deck, None, "collaboration".into()));
     Ok(Json(result))
 }
@@ -864,8 +1085,7 @@ async fn collaboration_socket(
 
 fn presence_sender(deck: &str, branch: &str) -> (broadcast::Sender<String>, bool) {
     let key = format!("{deck}:{branch}");
-    let rooms = PRESENCE_ROOMS.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-    let mut rooms = rooms.lock();
+    let mut rooms = PRESENCE_ROOMS.lock();
     if let Some(sender) = rooms.get(&key) {
         return (sender.clone(), false);
     }
@@ -875,8 +1095,7 @@ fn presence_sender(deck: &str, branch: &str) -> (broadcast::Sender<String>, bool
 }
 
 fn broadcast_presence(deck: &str, branch: &str, message: String) {
-    let rooms = PRESENCE_ROOMS.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-    if let Some(sender) = rooms.lock().get(&format!("{deck}:{branch}")) {
+    if let Some(sender) = PRESENCE_ROOMS.lock().get(&format!("{deck}:{branch}")) {
         let _ = sender.send(message);
     }
 }
@@ -966,7 +1185,7 @@ async fn handle_presence_socket(
                             state.set_live_presence(&deck,&branch,&actor,&connection_id,awareness.clone());
                             let _ = sender.send(awareness.to_string());
                         },
-                        Some("preview") if can_edit && last_preview.elapsed() >= std::time::Duration::from_millis(30) => {
+                        Some("preview") if can_edit && last_preview.elapsed() >= std::time::Duration::from_millis(50) => {
                             let Some(slide) = value["slideId"].as_str().filter(|id| present_store::jsonutil::valid_id(id)) else {continue;};
                             let Some(elements) = value["elements"].as_object().filter(|map| !map.is_empty() && map.len()<=64) else {continue;};
                             let ids: Vec<_> = elements.keys().cloned().collect();
@@ -984,7 +1203,16 @@ async fn handle_presence_socket(
                 _ => {}
             },
             outgoing = receiver.recv() => match outgoing {
-                Ok(message) => if socket.send(Message::Text(message.into())).await.is_err() { break; },
+                Ok(message) => {
+                    // Preview state is only useful to collaborators looking at that slide.
+                    // Keep awareness and durable invalidations branch-wide, but avoid sending
+                    // every drag update to clients that cannot display it.
+                    let is_other_slide_preview = serde_json::from_str::<serde_json::Value>(&message)
+                        .ok()
+                        .filter(|event| event["type"] == "preview")
+                        .is_some_and(|event| event["slideId"].as_str() != slide_id.as_deref());
+                    if !is_other_slide_preview && socket.send(Message::Text(message.into())).await.is_err() { break; }
+                },
                 Err(broadcast::error::RecvError::Lagged(_)) => if socket.send(Message::Text(serde_json::json!({"type":"resync"}).to_string().into())).await.is_err() {break;},
                 Err(_) => break,
             }
@@ -1150,19 +1378,27 @@ struct AgentScriptRequest {
     deck_title: String,
 }
 
-fn agent_settings(get: impl Fn(&str) -> Option<String>) -> Result<(reqwest::Url, String), AppError> {
+fn agent_settings(
+    get: impl Fn(&str) -> Option<String>,
+) -> Result<(reqwest::Url, String), AppError> {
     let required = |name: &str| {
         get(name)
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| AppError::Internal(format!("Agent is not configured. Set {name} in .local.env.")))
+            .ok_or_else(|| {
+                AppError::Internal(format!(
+                    "Agent is not configured. Set {name} in .local.env."
+                ))
+            })
     };
     let url = required("OPENAI_URL")?;
     let model = required("OPENAI_MODEL")?;
     let mut endpoint = reqwest::Url::parse(&url)
         .map_err(|_| AppError::Internal("OPENAI_URL must be a valid HTTP or HTTPS URL.".into()))?;
     if !matches!(endpoint.scheme(), "http" | "https") {
-        return Err(AppError::Internal("OPENAI_URL must be a valid HTTP or HTTPS URL.".into()));
+        return Err(AppError::Internal(
+            "OPENAI_URL must be a valid HTTP or HTTPS URL.".into(),
+        ));
     }
     let path = endpoint.path().trim_end_matches('/');
     let path = if path.ends_with("/chat/completions") {
@@ -1185,31 +1421,58 @@ mod agent_configuration_tests {
             "OPENAI_MODEL" => Some(" custom-provider/model ".into()),
             "OPENAI_BASE_URL" => Some("https://unused.example/v1".into()),
             _ => None,
-        }).unwrap();
-        assert_eq!(endpoint.as_str(), "https://provider.example/gateway/v1/chat/completions?tenant=demo");
+        })
+        .unwrap();
+        assert_eq!(
+            endpoint.as_str(),
+            "https://provider.example/gateway/v1/chat/completions?tenant=demo"
+        );
         assert_eq!(model, "custom-provider/model");
     }
 
     #[test]
     fn full_chat_endpoint_is_not_appended_twice() {
-        let (endpoint, _) = agent_settings(|name| Some(match name {
-            "OPENAI_URL" => "http://localhost:8080/v1/chat/completions/?version=1",
-            _ => "local-model",
-        }.into())).unwrap();
-        assert_eq!(endpoint.as_str(), "http://localhost:8080/v1/chat/completions?version=1");
+        let (endpoint, _) = agent_settings(|name| {
+            Some(
+                match name {
+                    "OPENAI_URL" => "http://localhost:8080/v1/chat/completions/?version=1",
+                    _ => "local-model",
+                }
+                .into(),
+            )
+        })
+        .unwrap();
+        assert_eq!(
+            endpoint.as_str(),
+            "http://localhost:8080/v1/chat/completions?version=1"
+        );
     }
 
     #[test]
     fn missing_url_or_model_does_not_silently_choose_a_provider() {
-        let error = agent_settings(|name| (name != "OPENAI_URL").then(|| "configured".into())).unwrap_err();
+        let error =
+            agent_settings(|name| (name != "OPENAI_URL").then(|| "configured".into())).unwrap_err();
         assert!(error.to_string().contains("OPENAI_URL"));
-        let error = agent_settings(|name| (name == "OPENAI_URL").then(|| "https://provider.example/v1".into())).unwrap_err();
+        let error = agent_settings(|name| {
+            (name == "OPENAI_URL").then(|| "https://provider.example/v1".into())
+        })
+        .unwrap_err();
         assert!(error.to_string().contains("OPENAI_MODEL"));
     }
 
     #[test]
     fn non_http_urls_are_rejected_before_sending_provider_requests() {
-        let error = agent_settings(|name| Some(if name == "OPENAI_URL" { "file:///tmp/provider" } else { "model" }.into())).unwrap_err();
+        let error = agent_settings(|name| {
+            Some(
+                if name == "OPENAI_URL" {
+                    "file:///tmp/provider"
+                } else {
+                    "model"
+                }
+                .into(),
+            )
+        })
+        .unwrap_err();
         assert!(error.to_string().contains("OPENAI_URL"));
     }
 }
@@ -1222,22 +1485,33 @@ async fn agent_script(
         return Err(AppError::BadRequest("Describe a task in 1–8,000 characters.".into()).into());
     }
     if input.feedback.len() > 32_000 || input.slides.len() > 30 {
-        return Err(AppError::BadRequest("Agent context exceeds the configured limits.".into()).into());
+        return Err(
+            AppError::BadRequest("Agent context exceeds the configured limits.".into()).into(),
+        );
     }
     let slide_text = serde_json::to_string(&input.slides).unwrap_or_default();
     if slide_text.len() > 80_000 {
-        return Err(AppError::BadRequest("The deck context is too large to send to the agent.".into()).into());
+        return Err(AppError::BadRequest(
+            "The deck context is too large to send to the agent.".into(),
+        )
+        .into());
     }
     let (endpoint, model) = agent_settings(|name| std::env::var(name).ok())?;
     let key = std::env::var("OPENAI_KEY")
         .or_else(|_| std::env::var("OPENAI_API_KEY"))
-        .map_err(|_| AppError::Internal("Agent is not configured. Set OPENAI_KEY in .local.env.".into()))?;
+        .map_err(|_| {
+            AppError::Internal("Agent is not configured. Set OPENAI_KEY in .local.env.".into())
+        })?;
     let system = "You create presentation slides as JavaScript for Present's restricted template scripting API. Return only executable JavaScript source, with no markdown fences. The program must return {initialSlides, slideOptions, customObjectTypes}; initialSlides should contain the proposed new slides and slideOptions must be an empty array. Use api.createSlide(name, background) and api.addElement(slide, element). Use only text, rect, ellipse, triangle, diamond, star, arrow, callout, line, and image slide elements. Coordinates use a 1920x1080 canvas. Keep the result visually coherent, concise, and editable. Do not use imports, network, filesystem, DOM, or browser APIs. Use deterministic IDs. The worker will execute and validate the script in an isolated worker.";
     let user = format!(
         "Deck: {}\nTask: {}\nFeedback for this revision: {}\nCurrent deck slide JSON: {}",
         input.deck_title,
         input.request.trim(),
-        if input.feedback.trim().is_empty() { "(none)" } else { input.feedback.trim() },
+        if input.feedback.trim().is_empty() {
+            "(none)"
+        } else {
+            input.feedback.trim()
+        },
         slide_text,
     );
     let client = reqwest::Client::builder()
@@ -1259,13 +1533,19 @@ async fn agent_script(
         .await
         .map_err(|error| AppError::Internal(format!("Agent request failed: {error}")))?;
     let status = response.status();
-    let body: serde_json::Value = response.json().await
+    let body: serde_json::Value = response
+        .json()
+        .await
         .map_err(|_| AppError::Internal("Agent returned an unreadable response.".into()))?;
     if !status.is_success() {
-        let message = body.pointer("/error/message").and_then(serde_json::Value::as_str).unwrap_or("The configured model rejected the request.");
+        let message = body
+            .pointer("/error/message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("The configured model rejected the request.");
         return Err(AppError::Internal(format!("Agent service error: {message}")).into());
     }
-    let script = body.pointer("/choices/0/message/content")
+    let script = body
+        .pointer("/choices/0/message/content")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| AppError::Internal("Agent response did not include a script.".into()))?
         .trim()
@@ -1275,9 +1555,13 @@ async fn agent_script(
         .trim_end_matches("```")
         .trim();
     if script.is_empty() || script.len() > 80_000 {
-        return Err(AppError::Internal("Agent returned an empty or oversized script.".into()).into());
+        return Err(
+            AppError::Internal("Agent returned an empty or oversized script.".into()).into(),
+        );
     }
-    Ok(Json(serde_json::json!({ "script": script, "model": model })))
+    Ok(Json(
+        serde_json::json!({ "script": script, "model": model }),
+    ))
 }
 
 #[derive(Deserialize)]
