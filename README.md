@@ -1,7 +1,7 @@
 # Present
 
-A basic, working implementation of the git-native presentation platform described in
-[`PLAN.md`](./PLAN.md).
+A git-native presentation editor. Each deck is a real Git repository, with semantic history,
+branching, and collaboration built into the editing workflow.
 
 Each deck is a real Git repository on disk. Slides are isolated folders containing a
 canonical JSON element AST, Markdown speaker notes, and co-located assets. The editor writes
@@ -106,6 +106,24 @@ bun run dev
 
 Open <http://127.0.0.1:5173>. Vite proxies API requests to Rust on port 3000. Sign up with a
 username, then create your first presentation from the home page.
+
+### Hackathon demo runbook
+
+For a local demo, start the API and web client in separate terminals using the development
+commands above. Open <http://127.0.0.1:5173>, create a username, and choose **Create a
+presentation**. The starter deck is a good guided path through editing, speaker notes, version
+history, sharing, and PowerPoint export. Agent features need the optional `OPENAI_URL`,
+`OPENAI_MODEL`, and `OPENAI_KEY` settings described below; the editor, templates, and exports do
+not.
+
+For a Docker demo, run `./present.sh` and open <http://localhost:3000>. Decks and demo profiles
+persist in the `present-data` volume between runs. Use `./present.sh status` to check the services
+and `./present.sh logs` to inspect startup errors. Avoid `docker compose down -v` unless you intend
+to erase the demo data.
+
+Before presenting from a new machine, run `cargo test --workspace`, `bun run build` from `web/`,
+and `bun test` from `web/`, then verify signup, deck creation, editing, sharing, and export in the
+browser.
 
 ### Docker
 

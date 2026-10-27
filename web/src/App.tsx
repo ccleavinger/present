@@ -88,7 +88,7 @@ export default function App() {
       <section class="auth-content">
         <div class="auth-brand"><span class="brand-mark">P</span><span>Present</span></div>
         <p class="auth-eyebrow">A little room for big ideas</p>
-        <h1 classList={{ "auth-tagline": mode() === "signup" }}>{mode() === "signup" ? "Collaborative slides so painless its a gift; Present." : "Welcome back."}</h1>
+        <h1 classList={{ "auth-tagline": mode() === "signup" }}>{mode() === "signup" ? "Collaborative slides, so painless it feels like a gift." : "Welcome back."}</h1>
         <p class="auth-copy">Create warm, thoughtful presentations and invite your people to build them with you.</p>
         <Show when={route().view === "share"}><div class="share-invitation-banner">
           <strong>{invitation()?.title ?? "Shared presentation"}</strong>
